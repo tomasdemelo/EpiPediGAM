@@ -1,0 +1,433 @@
+---
+title: "GAM_CityName_with_datatype-agegroupAbsent_numday-averages"
+output: html_document
+author: "Tomas de Melo"
+date: "2025-12-11"
+---
+
+```{r library, message=FALSE}
+#Load Libraries
+library(mgcv)
+library(dplyr)
+library(readxl)
+library(Metrics)
+library(MuMIn)
+library(openxlsx)
+library(ggplot2)
+library(forecast)
+```
+
+```{r variable_declaration,message=FALSE}
+#Variable Declarations
+setwd("enter/working/directory/file/path") #Change this to actual directory
+
+set.seed(01061867)
+n_sim <- 1000
+noise_levels <- seq(0,1, by = 0.1)
+
+offset_start <- -7 #Startingx point for offset loop or set to desired offset to check
+df <- data.frame(AICc=integer(),BIC=integer(),RMSE=integer(),
+                 Offset=integer(),R2=integer(),DevianceExplained=integer()
+                 ,InfAF=integer(),
+                 InfAPval=integer(),NoroF=integer(),NoroPval=integer(),
+                 EVF=integer(),EVPval=integer(),
+                 SampleSize=integer(),
+                 ResidualShapiroWilkTest=integer(),ACFResidual=integer()
+)
+datasummary <- data.frame(AICc=integer(),BIC=integer(),RMSE=integer(),Offset=integer(),R2=integer(),DevianceExplained=integer(),InfAF=integer(),InfAPval=integer(),NoroF=integer(),NoroPval=integer(),EVF=integer(),EVPval=integer(), SampleSize=integer(),ResidualShapiroWilkTest=integer(),ACFResidual=integer())
+
+
+meanresidualACF<-data.frame(matrix(0, ncol = 15, nrow = 15))
+meanEVACF<-data.frame(matrix(0, ncol = 15, nrow = 15))
+meanNoroACF<-data.frame(matrix(0, ncol = 15, nrow = 15))
+meanInfAACF<-data.frame(matrix(0, ncol = 15, nrow = 15))
+meanTotalAbsencesACF<-data.frame(matrix(0, ncol = 15, nrow = 15))
+
+#Output files/sheet names
+savesheetname <- "Sheet1"
+xlfilename <- "datatype-agegroupAbsent7d_GAM-values.xlsx"
+wb <- createWorkbook() #For MCS summary
+#Load merged data7d
+rawdata7d <- read_excel("2022CityNameData.xlsx", sheet = "Sheet1") 
+
+#Change to match desired date range
+start_date <- as.POSIXlt("2022-9-1")
+end_date <- as.POSIXlt("2022-12-30")
+o<-offset_start
+```
+
+```{r time-step GAM with MCS, warning=FALSE}
+#cycles through various offsets (usually -7 to +7 days applied to the predictor [TotalAbsences]) to find optimal model
+for (z in 1:15){
+  results <- 0
+  residualshapiro<-0
+  residualACF<-data.frame(matrix(0, ncol = 1, nrow = 15))
+  EVACF<-data.frame(matrix(0, ncol = 1, nrow = 15))
+  NoroACF<-data.frame(matrix(0, ncol = 1, nrow = 15))
+  InfAACF<-data.frame(matrix(0, ncol = 1, nrow = 15))
+  TotalAbsencesACF<-data.frame(matrix(0, ncol = 1, nrow = 15))
+  
+  #Creates data with offset
+  {  
+    #Filters data7d to desired range using the specified offset (z)
+    data7d <- rawdata7d %>%
+      filter(Date > start_date, Date < end_date) %>%
+      dplyr::select(Date, datatype-agegroup7drolling, InfA7drolling, EV7drolling, Noro7drolling)
+    var_start_date <- start_date-(o*(24*60*60))
+    var_end_date <- end_date-(o*(24*60*60))
+    #Obtain time shifted clinical data7d7d
+    ydata7d <- data7d %>%
+      filter(Date > var_start_date, Date < var_end_date)
+    EVdata7d <- data7d %>%
+      filter(!is.na(EV7drolling)) %>%
+      dplyr::select(Date,EV7drolling)
+    Norodata7d <- data7d %>%
+      filter(!is.na(Noro7drolling)) %>%
+      dplyr::select(Date,Noro7drolling)
+    WWdata7d <- data7d %>%
+      filter(!is.na(InfA7drolling),InfA7drolling>10^1.4) %>%
+      dplyr::select(Date,InfA7drolling)
+    Absenteedata7d <- ydata7d %>%
+      filter(!is.na(datatype-agegroup7drolling),datatype-agegroup7drolling>0.1) %>%
+      dplyr::select(Date,datatype-agegroup7drolling)
+    
+    #condense data7d for x and y 
+    ydata7d <- Absenteedata7d
+    xdata7d <- merge(EVdata7d, Norodata7d, by = "Date")
+    xdata7d <- merge(xdata7d, WWdata7d, by = "Date")
+    #Convert Dates to numeric
+    cross_join <- merge(xdata7d, ydata7d, by = NULL)
+    #Filter rows where dates are 'o' days apart
+    filtered_cross_join <- cross_join %>%
+      filter((Date.x) == Date.y - (o * (24 * 60 * 60)))
+    filtered_cross_join <- filtered_cross_join 
+    x <- log(c(filtered_cross_join$InfA7drolling))
+    
+    x3 <- log(c(filtered_cross_join$Noro7drolling))
+    x4 <- log(c(filtered_cross_join$EV7drolling))
+    y2 <- (c(filtered_cross_join$datatype-agegroup7drolling))
+    
+    Date <- c(filtered_cross_join$Date.x)
+    dfgam <- data.frame(Day=Date,TotalAbsences = y2, InfAWWdata7d = x,Norodata7d=x3,EVdata7d=x4)
+    observed<-data.frame()
+  }
+  
+  residualvalues <- data.frame(matrix(0, ncol = 1, nrow = length(dfgam$Day)))
+  lmresidual <- data.frame(matrix(0, ncol = 2, nrow = length(dfgam$Day)))
+  
+  ####            Runs GAM
+  {
+    
+    gam1 <- gam((TotalAbsences)~
+                  s(Norodata7d,k=round((length(unique(dfgam$Norodata7d))/4),0))
+                +
+                  s(EVdata7d,k=round((length(unique(dfgam$EVdata7d))/4),0))
+                +
+                  s(InfAWWdata7d,k=round((length(unique(dfgam$InfAWWdata7d))/4),0))
+                ,data=dfgam,method="REML",select=TRUE)
+    
+    
+    residualvalues<-residuals(gam1)
+    residualshapiro <- round((shapiro.test(residualvalues))$p.value,4)
+    #Generates data frame with yummy gam data
+    devexpl<-(round(summary(gam1)$dev.expl,2))
+    NoroF<- round(summary(gam1)$s.table[1,'F'],2)
+    NoroP<- round(summary(gam1)$s.table[1,'p-value'],6)
+    EVF<- round(summary(gam1)$s.table[2,'F'],2)
+    EVP<- round(summary(gam1)$s.table[2,'p-value'],6)
+    InfAF<- round(summary(gam1)$s.table[3,'F'],2)
+    InfAP<- round(summary(gam1)$s.table[3,'p-value'],6)
+    rsq<-round(summary(gam1)$r.sq,2)
+    N<-length(x)
+    FvsO <- data.frame(fitted = gam1$fitted.values, response = dfgam$TotalAbsences)
+    results<-rmse(FvsO$response,FvsO$fitted)
+    Responseshapiro <- round((shapiro.test(y2))$p.value,2)
+    InfAshapiro <- round((shapiro.test(x))$p.value,2)
+    Noroshapiro<- round((shapiro.test(x3))$p.value,2)
+    EVshapiro<- round((shapiro.test(x4))$p.value,2)
+    #Calculate AICc
+    aicc <- round(MuMIn::AICc(gam1),2)
+    #Calculate BIC
+    bic <- round(BIC(gam1),2)
+    residualACF<-as.numeric(acf(residualvalues,plot=FALSE,lag.max=14)$acf)
+    EVACF<-as.numeric(acf(dfgam$EVdata7d,plot=FALSE,lag.max=14)$acf)
+    NoroACF<-as.numeric(acf(dfgam$Norodata7d,plot=FALSE,lag.max=14)$acf)
+    InfAACF<-as.numeric(acf(dfgam$InfAWWdata7d,plot=FALSE,lag.max=14)$acf)
+    TotalAbsencesACF<-as.numeric(acf(dfgam$TotalAbsences,plot=FALSE,lag.max=14)$acf)
+    #New row to insert
+    df <- c(aicc,bic,results,o,rsq,devexpl,InfAF,InfAP,NoroF,NoroP,EVF,EVP,
+            N,residualshapiro,(residualACF[2]))
+    
+  }
+  meanresidualACF[,z]<-(residualACF)
+  meanEVACF[,z]<-(EVACF)
+  meanNoroACF[,z]<-(NoroACF)
+  meanInfAACF[,z]<-(InfAACF)
+  meanTotalAbsencesACF[,z]<-(TotalAbsencesACF)
+  if(median(residualshapiro) >= 0.05 & meanresidualACF[2,z] < 0.5){
+    
+    ######      ACF Plot
+    {
+      acf(meanresidualACF[,z], 
+          main = paste("ACF of residuals from",o,"day offset GAM"),   
+          xlab = "Day",               
+          ylab = "ACF",               
+          col = "lightblue",                   
+          border = "black",
+          names.arg = c("0","1", "2", "3", "4","5","6","7","8",
+                        "9","10","11","12","13"),
+          ylim = c(-1,1),
+          lwd=27
+      )
+      par(mfrow = c(2, 2)) 
+      acf(meanEVACF[,z], 
+          main = paste("ACF of EV used for",o,"day offset"),   
+          xlab = "Day",               
+          ylab = "ACF",               
+          col = "lightblue",                   
+          border = "black",
+          names.arg = c("0","1", "2", "3", "4","5","6","7","8",
+                        "9","10","11","12","13"),
+          ylim = c(-1,1),
+          lwd=7
+      )
+      
+      acf(meanNoroACF[,z], 
+          main = paste("ACF of Noro used for",o,"day offset"),   
+          xlab = "Day",               
+          ylab = "ACF",               
+          col = "lightblue",                   
+          border = "black",
+          names.arg = c("0","1", "2", "3", "4","5","6","7","8",
+                        "9","10","11","12","13"),
+          ylim = c(-1,1),
+          lwd=7
+      )
+      
+      acf(meanInfAACF[,z], 
+          main = paste("ACF of InfA used for",o,"day offset"),   
+          xlab = "Day",               
+          ylab = "ACF",               
+          col = "lightblue",                   
+          border = "black",
+          names.arg = c("0","1", "2", "3", "4","5","6","7","8",
+                        "9","10","11","12","13"),
+          ylim = c(-1,1),
+          lwd=7
+      )
+      
+      acf(meanTotalAbsencesACF[,z], 
+          main = paste("ACF of TotalAbsences used for ",o,"day offset"),   
+          xlab = "Day",               
+          ylab = "ACF",               
+          col = "lightblue",                   
+          border = "black",
+          names.arg = c("0","1", "2", "3", "4","5","6","7","8",
+                        "9","10","11","12","13"),
+          ylim = c(-1,1),
+          lwd=7
+      )
+    }
+    par(mfrow=c(1,1))
+    par(mfrow = c(2, 2)) 
+    ######      GAM Plot 
+    {
+      plot(dfgam$InfAWWdata7d,dfgam$EVdata7d,xlab = 'InfAnumday-rolling',ylab = 'EVnumday-rolling',
+           main = paste("InfA vs EV",o,"day offset"),pch=16)
+      fit1<-lm(EVdata7d~InfAWWdata7d,data=dfgam)
+      abline(fit1, col = "red", lwd = 3)
+      r_squared1 <- summary(fit1)$r.squared
+      legend("bottomright", legend = paste("R² =", round(r_squared1, 3)), bty = "n")
+      plot(dfgam$InfAWWdata7d,dfgam$Norodata7d,xlab = 'InfAnumday-rolling',ylab = 'Noronumday-rolling',
+           main = paste("InfA vs Noro",o,"day offset"),pch=16)
+      fit2<-lm(Norodata7d~InfAWWdata7d,data=dfgam)
+      abline(fit2, col = "red", lwd = 3)
+      r_squared2 <- summary(fit2)$r.squared
+      legend("bottomright", legend = paste("R² =", round(r_squared2, 3)), bty = "n")
+      plot(dfgam$Norodata7d,dfgam$EVdata7d,xlab = 'Noronumday-rolling',ylab = 'EVnumday-rolling',
+           main = paste("Noro vs EV",o,"day offset"),pch=16)
+      fit3<-lm(EVdata7d~Norodata7d,data=dfgam)
+      abline(fit3, col = "red", lwd = 3)
+      r_squared3 <- summary(fit1)$r.squared
+      legend("bottomright", legend = paste("R² =", round(r_squared3, 3)), bty = "n")
+      par(mfrow = c(1, 1))
+      
+      fitted_values <- predict(gam1, se.fit = TRUE)
+      ci_lower <- gam1$fitted.values - 1.96 * fitted_values$se.fit
+      ci_upper <- gam1$fitted.values+ 1.96 * fitted_values$se.fit
+      fittedvsobservedplot <- ggplot(dfgam, aes(x = Day)) +
+        geom_line(aes(y = TotalAbsences), color = "black", linewidth = 1.5) + 
+        geom_line(aes(y = gam1$fitted.values), color = "coral", linewidth = 1.5) +   
+        geom_point(aes(y = gam1$fitted.values), color = "coral", size = 2, alpha = 0.7) + 
+        geom_point(aes(y = TotalAbsences), color = "black", size = 2, alpha = 0.7) + 
+        geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "coral", alpha = 0.3, color = NA) + 
+        labs(title = paste("Plot of percent in Total Absences due to illness and \nGAM Fitted Values with a",o,"day offset from the Absenteeism data"),
+             x = "Date",
+             y = "percent in Absence due to illness") +
+        theme_minimal()
+      print(fittedvsobservedplot)
+      df<-na.omit(df)
+      
+      gam.check(gam1)
+      
+      plot(gam1, pages = 1, seWithMean = TRUE, 
+           residuals=TRUE,  pch = 1, cex = 1, shift = coef(gam1)[1],
+           main = paste("EV+InfA+Noro Fitted Effects at",o,"day offset"))
+    }
+    
+    #####       Stochastic Simulation/Plots
+    {
+      #Parameters
+      size <- as.numeric(length(noise_levels))
+      n_points <- length(dfgam$TotalAbsences)
+      Rsquaredvals <- matrix(NA, nrow = size, ncol = 2)
+      devexplvals <- matrix(NA,nrow = n_sim,ncol = size)
+      results <- data.frame()
+      summary <- data.frame()
+      noise <- 0
+      
+      for (s in 1:size) {
+        #Storage matrix
+        sim_TotalAbsences <- matrix(NA, nrow = n_sim, ncol = n_points)
+        #Estimate standard deviation for adding noise (can be tuned)
+        sd1 <- sd(dfgam$InfAWWdata7d, na.rm = TRUE) * noise  
+        sd2 <- sd(dfgam$Norodata7d, na.rm = TRUE) * noise
+        sd3 <- sd(dfgam$EVdata7d, na.rm = TRUE) * noise
+        
+        for (i in 1:n_sim) {
+          #Add noise
+          sim_data <- data.frame(
+            nInfAWWdata7d = dfgam$InfAWWdata7d + rnorm(n_points, 0, sd1),
+            nNorodata7d = dfgam$Norodata7d + rnorm(n_points, 0, sd2),
+            nEVdata7d = dfgam$EVdata7d + rnorm(n_points, 0, sd3),
+            TotalAbsences = dfgam$TotalAbsences
+          )
+          
+          gamMC <- gam((TotalAbsences)~
+                         s(nNorodata7d,k=round((length(unique(sim_data$nNorodata7d))/4),0))
+                       +
+                         s(nEVdata7d,k=round((length(unique(sim_data$nEVdata7d))/4),0))
+                       +
+                         s(nInfAWWdata7d,k=round((length(unique(sim_data$nInfAWWdata7d))/4),0))
+                       ,data=sim_data,method = "REML",select=TRUE)
+          
+          sim_TotalAbsences[i, ] <- predict(gamMC)
+          devexplvals [i,s] <- round(summary(gamMC)$dev.expl,2)
+          results <- rbind(results, data.frame(
+            noise_level = noise,
+            rep = i,
+            dev_expl = summary(gamMC)$dev.expl,
+            edf = sum(gamMC$edf)
+          )
+          )
+        }
+        
+        #Mean and 95% CI at each time point
+        mean_preds <- apply(sim_TotalAbsences, 2, mean)
+        lower_ci <- apply(sim_TotalAbsences, 2, quantile, probs = 0.05)
+        upper_ci <- apply(sim_TotalAbsences, 2, quantile, probs = 0.95)
+        
+        linear_model <- lm(mean_preds ~ dfgam$TotalAbsences)
+        r_squared <- summary(linear_model)$r.squared
+        
+        
+        Rsquaredvals[s,1] <- r_squared
+        Rsquaredvals[s,2] <- noise
+        
+        noise <- noise+0.1
+      }
+      
+      summary <- results %>%
+        group_by(noise_level) %>%
+        summarize(mean_dev = mean(dev_expl),
+                  sd_dev = sd(dev_expl),
+                  mean_edf = mean(edf),
+                  IQR = IQR(dev_expl)
+        )
+      
+      linear_robust <- ggplot(summary, aes(x = noise_level, y = mean_dev)) +
+        geom_line() +
+        geom_ribbon(aes(ymin = mean_dev - sd_dev, ymax = mean_dev + sd_dev), alpha = 0.2) +
+        labs(title = paste("Model Robustness Under Noise at a",o,"day offset"),
+             y = "Mean Deviance Explained",
+             x = "Relative % Noise") +
+        scale_y_continuous(limits = c(0, 1)) +
+        scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+        geom_vline(xintercept = seq(0, 1, 0.2), linetype = "dashed", color = "gray70", size = 0.3) +
+        theme_minimal()
+      
+      print(linear_robust)
+      
+      slope<-coef(lm(summary$mean_dev~summary$noise_level))["summary$noise_level"]
+      summary$Slope <- slope
+      
+      
+      boxplot_robust <- ggplot(results, aes(x = factor(noise_level), y = dev_expl)) +
+        geom_boxplot() +
+        labs(
+          title = paste("Distribution of Mean Deviance Explained by Noise Level at a",o,"day offset"),
+          x = "Relative % Noise",
+          y = "Mean Deviance Explained"
+        ) +
+        scale_y_continuous(limits = c(0, 1)) +
+        theme_minimal() +
+        theme(
+          panel.background = element_blank(),
+          plot.background = element_blank()
+        )
+      print(boxplot_robust)
+      sheetMCS <- as.character(o)
+      print(sheetMCS)
+      addWorksheet(wb, sheetMCS)
+      writeData(wb, sheet = sheetMCS, x = summary)
+    }
+    
+  }
+  
+  datasummary[z,] <- c(df[1],(df[2]),(df[3]),o,(df[5]),(df[6]),
+                       (df[7]),(df[8]),(df[9]),(df[10]),(df[11]),(df[12]),N,
+                       (residualshapiro),(meanresidualACF[2,z]))
+  
+  datasummary<-na.omit(datasummary)
+  o<-o+1
+}
+
+datasetsummary <- datasummary[datasummary$ResidualShapiroWilkTest >= 0.05 & datasummary$ACFResidual < 0.5, ]
+
+
+
+score <- rep(0, nrow(datasetsummary))
+metrics <- c("AICc", "BIC", "RMSE")
+
+for (metric in metrics) {
+  min_val <- min(datasetsummary[[metric]], na.rm = TRUE)
+  score[datasetsummary[[metric]] == min_val] <- score[datasetsummary[[metric]] == min_val] + 1
+}
+best_rows <- which(score == max(score))
+BestModel <- datasetsummary[best_rows, ]
+
+print(paste("The best performing Model had a...",BestModel$Offset,
+            "day offset with an AICc of...",BestModel$AICc,
+            "a BIC of...",BestModel$BIC,"an RMSE of...",round(BestModel$RMSE,3), 
+            "and", (BestModel[1,6])*100,"% Deviance Explained"))
+print(datasetsummary)
+if (nrow(BestModel)>0){
+  saveWorkbook(wb, "CityName_datatype-agegroupAbsent7d_GAM-Stochastic.xlsx", overwrite = TRUE)
+write.xlsx(BestModel, file = "CityName_datatype-agegroupAbsent7d_GAM-metrics.xlsx",sheetName="Sheet1",append=TRUE)
+
+observed<-dfgam %>%
+        select(Day,TotalAbsences)
+      observed$fitted <- gam1$fitted.values
+      
+      fitted_values <- predict(gam1, se.fit = TRUE)
+      ci_lower <- gam1$fitted.values - 1.96 * fitted_values$se.fit
+      ci_upper <- gam1$fitted.values+ 1.96 * fitted_values$se.fit
+      
+      observed$ci_lower <- ci_lower
+      observed$ci_upper <- ci_upper
+
+write.xlsx(observed, file = "CityName_datatype-agegroupAbsent7d_GAM-values.xlsx",sheetName="Sheet1",append=TRUE)
+} else{
+  print("null")
+}
+```
