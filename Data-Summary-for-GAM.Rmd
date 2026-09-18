@@ -1,42 +1,86 @@
 ---
 title: "GAM Data Summary"
 author: "Tomas de Melo"
-date: "2025-11-13"
-output: html_document
+date: "2026-08-12"
+output: 
+  html_document: default
+  pdf_document: default
 ---
 
 ```{r Data Summarization Script for GAM_MCS, include=TRUE, warning=FALSE,fig.width = 12, fig.height = 6}
 library(readxl)
 library(openxlsx)
 library(dplyr)
-library(stringr) #has the function str_detect()
-library(patchwork) #For printing grids of ggplot
+library(stringr) # has the function str_detect()
+library(patchwork) # For printing grids of ggplot
 library(ggplot2)
+library(ggrepel) # For labelling plot outliers
 library(dunn.test)
-library(ggpubr) 
+library(ggpubr)
+library(ggsignif)
 library(pracma)
 
+# Set project root directory.
+PROJ <- local({
+  for (cand in c(getwd(), dirname(getwd()), ".")) {
+    if (file.exists(file.path(cand, "run_all.R")) ||
+        (file.exists(file.path(cand, "2022AjaxData.xlsx")) && file.exists(file.path(cand, "2022PickeringData.xlsx"))) ||
+        dir.exists(file.path(cand, "Outputs", "Excel Files REMOTE")) ||
+        dir.exists(file.path(cand, "Excel Files REMOTE"))) {
+      return(normalizePath(cand))
+    }
+  }
+  getwd()
+})
+
+# Set results directory.
+RESULTS_DIR <- Sys.getenv("GAM_RESULTS_DIR", "")
+if (!nzchar(RESULTS_DIR)) {
+  if (dir.exists(file.path(PROJ, "Outputs", "Excel Files REMOTE"))) {
+    RESULTS_DIR <- "Outputs/Excel Files REMOTE"
+  } else if (dir.exists(file.path(PROJ, "Excel Files REMOTE"))) {
+    RESULTS_DIR <- "Excel Files REMOTE"
+  } else {
+    RESULTS_DIR <- "Clean Baseline Outputs"
+  }
+}
+if (!dir.exists(file.path(PROJ, RESULTS_DIR))) {
+  stop("Results directory not found: ", file.path(PROJ, RESULTS_DIR),
+    "\n  Set GAM_RESULTS_DIR to the folder holding the *_GAM-metrics.xlsx files.")
+}
+cat("Project directory:", PROJ, "\n")
+cat("Results directory:", RESULTS_DIR, "\n")
+
 {
-setwd("enter/working/directory/file/path") #Change this to actual directory
-  
+  # Define model set.
+  setwd(file.path(PROJ, RESULTS_DIR))
+
+  # Exclude 1-day control arm from pooled aggregates.
+  INCLUDE_1D_IN_POOLED <- TRUE
+
   SMA <- vector("list")
-  type <- vector ("list")
+  type <- vector("list")
   age <- vector("list")
   city <- vector("list")
   data_list <- list()
-  
-  fval_list <- c('InfAF','NoroF','EVF')
-  metric_list <-c('mean_dev','mean_edf') #,'sd_dev','IQR')
-  metric_name_list <- c('Deviance Explained','Effective Degrees of Freedom') #,'Standard Deviation','Interquartile Range')
-  group_list <- c('SMA','age','type','city')
+
+  devdrop_list <- c("InfADropDevPct", "NoroDropDevPct", "EVDropDevPct")
+  metric_list <- c("mean_dev", "mean_edf") # ,'sd_dev','IQR')
+  metric_name_list <- c("Deviance Explained", "Effective Degrees of Freedom") # ,'Standard Deviation','Interquartile Range')
+  group_list <- c("SMA", "age", "type", "city")
   file_matches <- list.files(pattern = ".*_GAM-values.xlsx|.*_GAM-metrics.xlsx", full.names = TRUE)
-  file_matchesMCS <- list.files(pattern = ".*_GAM-Stochastic.xlsx", full.names = TRUE)
+  file_matchesMCS <- list.files(pattern = ".*_GAM-Monte-Carlo.xlsx", full.names = TRUE)
   file_names <- gsub("\\.xlsx$", "", basename(file_matches))
-  
-  
-  #Extracts data from excel files
+
+
+  # Extract Excel data
   for (file in file_matches) {
     df <- read_excel(file, col_names = TRUE)
+    
+    # Post-process filter: Exclude models with ACF > 0.4
+    if ("ACFResidual" %in% names(df)) {
+      df <- df[df$ACFResidual <= 0.4, ]
+    }
     for (col in names(df)) {
       if (nrow(df) == 0) {
         zero_row <- data.frame(matrix(0, nrow = 1, ncol = ncol(df)))
@@ -46,113 +90,132 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
     }
     data_list[[basename(file)]] <- df
   }
-  for (file in file_matchesMCS){
-    fileMCS <- paste0(substr(file, start = 3, stop = nchar(file) - 16),"metrics.xlsx")
-    corresponding_metrics <- data_list[str_detect(names(data_list),pattern=fileMCS)]
-    if (length(corresponding_metrics) != 0){
+  for (file in file_matchesMCS) {
+    base_file <- basename(file)
+    fileMCS <- paste0(substr(base_file, start = 1, stop = nchar(base_file) - 16), "metrics.xlsx")
+    corresponding_metrics <- data_list[str_detect(names(data_list), pattern = fileMCS)]
+    if (length(corresponding_metrics) != 0) {
       offset <- as.character(corresponding_metrics[[1]]$Offset)
       devexpl <- corresponding_metrics[[1]]$DevianceExplained
-      if (devexpl != 0){  
-        if (length(offset) != 0){
-          df <- read_excel(file, col_names = TRUE, sheet = offset)
+      if (devexpl != 0) {
+        if (length(offset) != 0) {
+          tryCatch(
+            {
+              df <- read_excel(file, col_names = TRUE, sheet = paste0(offset, "_prelog"))
+            },
+            error = function(e) {
+              df <<- read_excel(file, col_names = TRUE, sheet = offset)
+            }
+          )
           data_list[[basename(file)]] <- df
         }
       }
     }
-  } 
+  }
   values_data <- data_list[str_detect(names(data_list), pattern = ".*_GAM-values")]
   dfs_list <- vector("list", length(values_data))
-  
-  #Pools and organizes data sheets
+
+  # Organize data sheets
   for (i in seq_along(names(values_data))) {
     filename <- names(values_data[i])
     prefix <- substr(filename, start = 1, stop = nchar(filename) - 16)
     col_name <- colnames(values_data[[i]])[2]
-    if (nrow(values_data[[i]]!=0)){
+    if (nrow(values_data[[i]] != 0)) {
       observed_df <- values_data[[i]] %>%
         select(!!sym(col_name)) %>%
         mutate(filename = filename)
-      
+
       dfs_list[[i]] <- observed_df
-      
-      file_to_combine <- paste(substr(filename,1,nchar(filename)-11),"metrics.xlsx",sep="")
-      file_to_combineMCS <- paste(substr(filename,1,nchar(filename)-11),"Stochastic.xlsx",sep="")
-      
-      data_list[[file_to_combine]]$NRMSE <- data_list[[file_to_combine]]$RMSE/(max(observed_df[,1])-min(observed_df[,1]))
-      data_list[[file_to_combine]]$file <- file_to_combine
-      data_list[[file_to_combineMCS]]$file <- file_to_combineMCS
-      
-      data_list[[file_to_combine]] <- data_list[[file_to_combine]] %>%
-        filter(!is.na(data_list[[file_to_combine]]$AICc))
-      
-      data_list[[file_to_combineMCS]] <- data_list[[file_to_combineMCS]] %>%
-        filter(!is.na(data_list[[file_to_combineMCS]]$mean_dev))
-      
-      if (grepl("xd",filename)){
-        SMA[["xd_Metrics"]] <- bind_rows(SMA[["xd_Metrics"]],data_list[[file_to_combine]])
-        SMA[["xd_MCS"]] <- bind_rows(SMA[["xd_MCS"]],data_list[[file_to_combineMCS]])
-      } 
-      if (grepl("xxd",filename)){
-        SMA[["xxd_Metrics"]] <- bind_rows(SMA[["xxd_Metrics"]],data_list[[file_to_combine]])
-        SMA[["xxd_MCS"]] <- bind_rows(SMA[["xxd_MCS"]],data_list[[file_to_combineMCS]])
-      } 
-      if (grepl("xxxd",filename)){
-        SMA[["xxxd_Metrics"]] <- bind_rows(SMA[["xxxd_Metrics"]],data_list[[file_to_combine]])
-        SMA[["xxxd_MCS"]] <- bind_rows(SMA[["xxxd_MCS"]],data_list[[file_to_combineMCS]])
+
+      file_to_combine <- paste(substr(filename, 1, nchar(filename) - 11), "metrics.xlsx", sep = "")
+      file_to_combineMCS <- paste(substr(filename, 1, nchar(filename) - 11), "Monte-Carlo.xlsx", sep = "")
+
+      if (!is.null(data_list[[file_to_combine]])) {
+        data_list[[file_to_combine]]$NRMSE <- data_list[[file_to_combine]]$RMSE / (max(observed_df[, 1]) - min(observed_df[, 1]))
+        data_list[[file_to_combine]]$file <- file_to_combine
+
+        data_list[[file_to_combine]] <- data_list[[file_to_combine]] %>%
+          filter(!is.na(data_list[[file_to_combine]]$AICc))
       }
-      if (grepl("agegroup1",filename)){
-        age[["agegroup1_Metrics"]] <- bind_rows(age[["agegroup1_Metrics"]],data_list[[file_to_combine]])
-        age[["agegroup1_MCS"]] <- bind_rows(age[["agegroup1_MCS"]],data_list[[file_to_combineMCS]])
-      } 
-      if (grepl("agegroup2",filename)){
-        age[["agegroup2_Metrics"]] <- bind_rows(age[["agegroup2_Metrics"]],data_list[[file_to_combine]])
-        age[["agegroup2_MCS"]] <- bind_rows(age[["agegroup2_MCS"]],data_list[[file_to_combineMCS]])
-      } 
-      if (grepl("agegroup3",filename)){
-        age[["agegroup3_Metrics"]] <- bind_rows(age[["agegroup3_Metrics"]],data_list[[file_to_combine]])
-        age[["agegroup3_MCS"]] <- bind_rows(age[["agegroup3_MCS"]],data_list[[file_to_combineMCS]])
+
+      if (!is.null(data_list[[file_to_combineMCS]])) {
+        data_list[[file_to_combineMCS]]$file <- file_to_combineMCS
+
+        data_list[[file_to_combineMCS]] <- data_list[[file_to_combineMCS]] %>%
+          filter(!is.na(data_list[[file_to_combineMCS]]$mean_dev))
       }
-      if (grepl("percent",filename)){
-        type[["prevelance_Metrics"]] <- bind_rows(type[["prevelance_Metrics"]],data_list[[file_to_combine]])
-        type[["prevelance_MCS"]] <- bind_rows(type[["prevelance_MCS"]],data_list[[file_to_combineMCS]])
-      } 
-      if (grepl("percentchange",filename)){
-        type[["datatype1_Metrics"]] <- bind_rows(type[["datatype1_Metrics"]],data_list[[file_to_combine]])
-        type[["datatype1_MCS"]] <- bind_rows(type[["datatype1_MCS"]],data_list[[file_to_combineMCS]])
-      } 
-      if (grepl("Cityname2",filename)){
-        city[["Cityname2_Metrics"]] <- bind_rows(city[["Cityname2_Metrics"]],data_list[[file_to_combine]])
-        city[["Cityname2_MCS"]] <- bind_rows(city[["Cityname2_MCS"]],data_list[[file_to_combineMCS]])
-      } 
-      if (grepl("Cityname1",filename)){
-        city[["Cityname1_Metrics"]] <- bind_rows(city[["Cityname1_Metrics"]],data_list[[file_to_combine]])
-        city[["Cityname1_MCS"]] <- bind_rows(city[["Cityname1_MCS"]],data_list[[file_to_combineMCS]])
-        
-        
+
+      is_1d <- grepl("Absent1d", filename)
+      pool_ok <- INCLUDE_1D_IN_POOLED | !is_1d
+
+      if (is_1d) {
+        SMA[["1d_Metrics"]] <- bind_rows(SMA[["1d_Metrics"]], data_list[[file_to_combine]])
+        SMA[["1d_MCS"]] <- bind_rows(SMA[["1d_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (grepl("3d", filename)) {
+        SMA[["3d_Metrics"]] <- bind_rows(SMA[["3d_Metrics"]], data_list[[file_to_combine]])
+        SMA[["3d_MCS"]] <- bind_rows(SMA[["3d_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (grepl("5d", filename)) {
+        SMA[["5d_Metrics"]] <- bind_rows(SMA[["5d_Metrics"]], data_list[[file_to_combine]])
+        SMA[["5d_MCS"]] <- bind_rows(SMA[["5d_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (grepl("7d", filename)) {
+        SMA[["7d_Metrics"]] <- bind_rows(SMA[["7d_Metrics"]], data_list[[file_to_combine]])
+        SMA[["7d_MCS"]] <- bind_rows(SMA[["7d_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (pool_ok & (grepl("Elementary", filename))) {
+        age[["Elementary_Metrics"]] <- bind_rows(age[["Elementary_Metrics"]], data_list[[file_to_combine]])
+        age[["Elementary_MCS"]] <- bind_rows(age[["Elementary_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (pool_ok & (grepl("Secondary", filename))) {
+        age[["Secondary_Metrics"]] <- bind_rows(age[["Secondary_Metrics"]], data_list[[file_to_combine]])
+        age[["Secondary_MCS"]] <- bind_rows(age[["Secondary_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (pool_ok & (grepl("Total", filename))) {
+        age[["Total_Metrics"]] <- bind_rows(age[["Total_Metrics"]], data_list[[file_to_combine]])
+        age[["Total_MCS"]] <- bind_rows(age[["Total_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (pool_ok & (grepl("percent", filename) & !grepl("percentchange", filename))) {
+        type[["prevelance_Metrics"]] <- bind_rows(type[["prevelance_Metrics"]], data_list[[file_to_combine]])
+        type[["prevelance_MCS"]] <- bind_rows(type[["prevelance_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (pool_ok & (grepl("percentchange", filename))) {
+        type[["incidence_Metrics"]] <- bind_rows(type[["incidence_Metrics"]], data_list[[file_to_combine]])
+        type[["incidence_MCS"]] <- bind_rows(type[["incidence_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (pool_ok & (grepl("Pickering", filename))) {
+        city[["Pickering_Metrics"]] <- bind_rows(city[["Pickering_Metrics"]], data_list[[file_to_combine]])
+        city[["Pickering_MCS"]] <- bind_rows(city[["Pickering_MCS"]], data_list[[file_to_combineMCS]])
+      }
+      if (pool_ok & (grepl("Ajax", filename))) {
+        city[["Ajax_Metrics"]] <- bind_rows(city[["Ajax_Metrics"]], data_list[[file_to_combine]])
+        city[["Ajax_MCS"]] <- bind_rows(city[["Ajax_MCS"]], data_list[[file_to_combineMCS]])
       }
     }
   }
-  #####MCS Results
-  A_list <- c('x-day SMA','agegroup1','percent','Cityname2')
-  A <- list('SMA$xd_MCS' = SMA$`xd_MCS`,'age$agegroup1_MCS' = age$agegroup1_MCS,"type$prevelance_MCS" = type$prevelance_MCS, "city$Cityname2_MCS" = city$Cityname2_MCS)
-  A <- A[!sapply(A, is.null)]
-  B_list <- c('xx-day SMA','agegroup2','percentchange','Cityname1')
-  B <- list('SMA$xxd_MCS' = SMA$`xxd_MCS`,'age$agegroup2_MCS' = age$agegroup2_MCS,"type$datatype1_MCS" = type$datatype1_MCS, "city$Cityname1_MCS" = city$Cityname1_MCS)
-  B <- B[!sapply(B, is.null)]
-  C_list <-c('xxx-day SMA','agegroup3',"type3",'city3')
-  C <- list('SMA$xxxd_MCS' = SMA$`xxxd_MCS`,'age$agegroup3_MCS' = age$agegroup3_MCS,"type$prevelance_MCS" = type$prevelance_MCS, "city$Cityname2_MCS" = city$Cityname2_MCS) 
-  C <- C[!sapply(C, is.null)]
-  
-  
-  #condense reporting of slope/y_cross to print from one if statement and insert metric into print statement too
+  # Stochastic simulation results.
+  A_list <- c("3-day SMA", "Elementary", "percent", "pickering")
+  A <- list("SMA$3d_MCS" = SMA$`3d_MCS`, "age$Elementary_MCS" = age$Elementary_MCS, "type$prevelance_MCS" = type$prevelance_MCS, "city$Pickering_MCS" = city$Pickering_MCS)
+  B_list <- c("5-day SMA", "Secondary", "percentchange", "ajax")
+  B <- list("SMA$5d_MCS" = SMA$`5d_MCS`, "age$Secondary_MCS" = age$Secondary_MCS, "type$incidence_MCS" = type$incidence_MCS, "city$Ajax_MCS" = city$Ajax_MCS)
+  C_list <- c("7-day SMA", "Total", "type3", "city3")
+  C <- list("SMA$7d_MCS" = SMA$`7d_MCS`, "age$Total_MCS" = age$Total_MCS, "type$prevelance_MCS" = type$prevelance_MCS, "city$Pickering_MCS" = city$Pickering_MCS)
+  # Format 1-day control simulation plots.
+  D_list <- c("1-day (raw)", "age4", "type4", "city4")
+  D <- list("SMA$1d_MCS" = SMA$`1d_MCS`, "age$Total_MCS" = age$Total_MCS, "type$prevelance_MCS" = type$prevelance_MCS, "city$Pickering_MCS" = city$Pickering_MCS)
+
+  # Format metric reporting
   for (g in 1:length(group_list)) {
-    i<-1
-    
-    for (metric in (metric_list)) {  
-      
-      
+    i <- 1
+
+    for (metric in (metric_list)) {
       calc_summary <- function(df, metric) {
+        if (is.null(df)) {
+          return(data.frame())
+        }
         df %>%
+          filter(!is.na(noise_level)) %>%
           group_by(noise_level) %>%
           summarise(
             mean_metric = mean(.data[[metric]], na.rm = TRUE),
@@ -161,13 +224,10 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           ) %>%
           mutate(
             se = sd_metric / sqrt(n),
-            ci_lower = mean_metric - qt(0.975, n-1) * se,
-            ci_upper = mean_metric + qt(0.975, n-1) * se
+            ci_lower = mean_metric - qt(0.975, n - 1) * se,
+            ci_upper = mean_metric + qt(0.975, n - 1) * se
           )
       }
-      
-      df <- df %>%
-        filter(!is.na(df$noise_level))
       if (metric == "mean_dev") {
         ymin <- 0
         ymax <- 1
@@ -183,167 +243,228 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
       } else if (metric == "mean_edf") {
         ymin <- 0
         ymax <- 20
-        mid <- -8 
+        mid <- -8
       }
-      
+
       {
-        #compute summaries for all three SMA windows once
-        SMA_xd_summary <- lapply(A[g], calc_summary, metric = metric) 
-        SMA_xxd_summary <- lapply(B[g], calc_summary, metric = metric)
-        SMA_xxxd_summary <- lapply(C[g], calc_summary, metric = metric)
-        
-        SMA_xd_summary <- SMA_xd_summary[[1]]
-        SMA_xxd_summary <- SMA_xxd_summary[[1]]
-        SMA_xxxd_summary <- SMA_xxxd_summary[[1]]
-        
-        #If any of the summaries are empty (safety), create an empty tibble to prevent errors
-        if (nrow(SMA_xd_summary) == 0) SMA_xd_summary <- tibble(noise_level = numeric(0), mean_metric = numeric(0), ci_lower = numeric(0), ci_upper = numeric(0))
-        if (nrow(SMA_xxd_summary) == 0) SMA_xxd_summary <- tibble(noise_level = numeric(0), mean_metric = numeric(0), ci_lower = numeric(0), ci_upper = numeric(0))
-        if (nrow(SMA_xxxd_summary) == 0) SMA_xxxd_summary <- tibble(noise_level = numeric(0), mean_metric = numeric(0), ci_lower = numeric(0), ci_upper = numeric(0))
-        
-        SMA_xd_summary <- na.omit(SMA_xd_summary)
-        SMA_xxd_summary <- na.omit(SMA_xxd_summary)
-        SMA_xxxd_summary <- na.omit(SMA_xxxd_summary)
-        
-        #x-day plot 
-        SMAxd_line <- lm(SMA_xd_summary$mean_metric~SMA_xd_summary$noise_level)
-        coef_vals_xd <- coef(SMAxd_line)
-        intercept_xd <- coef_vals_xd[1]
-        slope_xd <- coef_vals_xd[2]
-        
-        y_cross0.5_xd <- (mid - intercept_xd) / slope_xd
-        y_cross0.5_xd 
-        
-        plot_SMAxd <- ggplot(SMA_xd_summary, aes(x = noise_level, y = mean_metric)) +
+        # Compute simulation summaries across smoothing windows.
+        SMA_1d_summary <- lapply(D[g], calc_summary, metric = metric)
+        SMA_3d_summary <- lapply(A[g], calc_summary, metric = metric)
+        SMA_5d_summary <- lapply(B[g], calc_summary, metric = metric)
+        SMA_7d_summary <- lapply(C[g], calc_summary, metric = metric)
+
+        SMA_1d_summary <- SMA_1d_summary[[1]]
+        SMA_3d_summary <- SMA_3d_summary[[1]]
+        SMA_5d_summary <- SMA_5d_summary[[1]]
+        SMA_7d_summary <- SMA_7d_summary[[1]]
+
+        # Ensure non-empty tibble structure.
+        if (nrow(SMA_1d_summary) == 0) SMA_1d_summary <- tibble(noise_level = numeric(0), mean_metric = numeric(0), ci_lower = numeric(0), ci_upper = numeric(0))
+        if (nrow(SMA_3d_summary) == 0) SMA_3d_summary <- tibble(noise_level = numeric(0), mean_metric = numeric(0), ci_lower = numeric(0), ci_upper = numeric(0))
+        if (nrow(SMA_5d_summary) == 0) SMA_5d_summary <- tibble(noise_level = numeric(0), mean_metric = numeric(0), ci_lower = numeric(0), ci_upper = numeric(0))
+        if (nrow(SMA_7d_summary) == 0) SMA_7d_summary <- tibble(noise_level = numeric(0), mean_metric = numeric(0), ci_lower = numeric(0), ci_upper = numeric(0))
+
+        SMA_1d_summary <- na.omit(SMA_1d_summary)
+        SMA_3d_summary <- na.omit(SMA_3d_summary)
+        SMA_5d_summary <- na.omit(SMA_5d_summary)
+        SMA_7d_summary <- na.omit(SMA_7d_summary)
+
+        # 1-day (raw) plot
+        SMA1d_line <- lm(SMA_1d_summary$mean_metric ~ SMA_1d_summary$noise_level)
+        coef_vals_1d <- coef(SMA1d_line)
+        intercept_1d <- coef_vals_1d[1]
+        slope_1d <- coef_vals_1d[2]
+        y_cross0.5_1d <- round((mid - intercept_1d) / slope_1d, 2)
+
+        plot_SMA1d <- ggplot(SMA_1d_summary, aes(x = noise_level, y = mean_metric)) +
+          geom_smooth(method = "lm", se = FALSE, color = "black") +
+          geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "#4A6FA5", alpha = 0.2) +
+          geom_point(color = "#4A6FA5") +
+          geom_segment(aes(x = 0, y = mid, xend = 1, yend = mid),
+            linetype = "dashed", color = "black", alpha = 0.4
+          ) +
+          scale_x_continuous(
+            name = "Relative % Noise",
+            limits = c(0, 1),
+            breaks = seq(0, 1, by = 0.1)
+          ) +
+          labs(
+            title = paste0("Mean ", metric_name_list[i], " \n- ", D_list[g]),
+            y = paste0("Mean ", metric_name_list[i])
+          ) +
+          theme_minimal() +
+          ylim(ymin, ymax)
+
+        # 3-day plot
+        SMA3d_line <- lm(SMA_3d_summary$mean_metric ~ SMA_3d_summary$noise_level)
+        coef_vals_3d <- coef(SMA3d_line)
+        intercept_3d <- coef_vals_3d[1]
+        slope_3d <- coef_vals_3d[2]
+
+        y_cross0.5_3d <- (mid - intercept_3d) / slope_3d
+        y_cross0.5_3d
+
+        plot_SMA3d <- ggplot(SMA_3d_summary, aes(x = noise_level, y = mean_metric)) +
           geom_smooth(method = "lm", se = FALSE, color = "black") +
           geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "#D40000", alpha = 0.2) +
+          
           geom_point(color = "#D40000") +
-          geom_segment(aes(x = 0, y = mid, xend = 1, yend = mid), 
-                       linetype = "dashed", color = "black", alpha = 0.4) +  #horizontal dashed line
+          geom_segment(aes(x = 0, y = mid, xend = 1, yend = mid),
+            linetype = "dashed", color = "black", alpha = 0.4
+          ) + # horizontal dashed line
           scale_x_continuous(
-            name = "Relative % Noise", 
+            name = "Relative % Noise",
             limits = c(0, 1),
             breaks = seq(0, 1, by = 0.1)
           ) +
           labs(
-            title = paste0("Mean ", metric_name_list[i], " \n- ",A_list[g]),
+            title = paste0("Mean ", metric_name_list[i], " \n- ", A_list[g]),
             y = paste0("Mean ", metric_name_list[i])
           ) +
           theme_minimal() +
           ylim(ymin, ymax)
-        
-        
-        #xx-day plot
-        SMAxxd_line <- lm(SMA_xxd_summary$mean_metric~SMA_xxd_summary$noise_level)
-        coef_vals_xxd <- coef(SMAxxd_line)
-        intercept_xxd <- coef_vals_xxd[1]
-        slope_xxd <- coef_vals_xxd[2]
-        
-        y_cross0.5_xxd <- (mid - intercept_xxd) / slope_xxd
-        y_cross0.5_xxd <- round(y_cross0.5_xxd, 2)
-        
-        plot_SMAxxd <- ggplot(SMA_xxd_summary, aes(x = noise_level, y = mean_metric)) +
+
+
+        # 5-day plot
+        SMA5d_line <- lm(SMA_5d_summary$mean_metric ~ SMA_5d_summary$noise_level)
+        coef_vals_5d <- coef(SMA5d_line)
+        intercept_5d <- coef_vals_5d[1]
+        slope_5d <- coef_vals_5d[2]
+
+        y_cross0.5_5d <- (mid - intercept_5d) / slope_5d
+        y_cross0.5_5d <- round(y_cross0.5_5d, 2)
+
+        plot_SMA5d <- ggplot(SMA_5d_summary, aes(x = noise_level, y = mean_metric)) +
           geom_smooth(method = "lm", se = FALSE, color = "black") +
           geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "#8A040D", alpha = 0.2) +
-          #geom_line(color = "#8A040D") +
+          
           geom_point(color = "#8A040D") +
-          geom_segment(aes(x = 0, y = mid, xend = 1, yend = mid), 
-                       linetype = "dashed", color = "black", alpha = 0.4) +  
+          geom_segment(aes(x = 0, y = mid, xend = 1, yend = mid),
+            linetype = "dashed", color = "black", alpha = 0.4
+          ) +
           scale_x_continuous(
-            name = "Relative % Noise", 
+            name = "Relative % Noise",
             limits = c(0, 1),
             breaks = seq(0, 1, by = 0.1)
           ) +
           labs(
-            title = paste0("Mean ", metric_name_list[i], " \n- ",B_list[g]),
+            title = paste0("Mean ", metric_name_list[i], " \n- ", B_list[g]),
             y = paste0("Mean ", metric_name_list[i])
           ) +
           theme_minimal() +
           ylim(ymin, ymax)
-        
-        
-        #xxx-day plot 
-        SMAxxxd_line <- lm(SMA_xxxd_summary$mean_metric~SMA_xxxd_summary$noise_level)
-        coef_vals_xxxd <- coef(SMAxxxd_line)
-        intercept_xxxd <- coef_vals_xxxd[1]
-        slope_xxxd <- coef_vals_xxxd[2]
-        
-        y_cross0.5_xxxd <- (mid - intercept_xxxd) / slope_xxxd
-        y_cross0.5_xxxd 
-        
-        plot_SMAxxxd <- ggplot(SMA_xxxd_summary, aes(x = noise_level, y = mean_metric)) +
+
+
+        # 7-day plot
+        SMA7d_line <- lm(SMA_7d_summary$mean_metric ~ SMA_7d_summary$noise_level)
+        coef_vals_7d <- coef(SMA7d_line)
+        intercept_7d <- coef_vals_7d[1]
+        slope_7d <- coef_vals_7d[2]
+
+        y_cross0.5_7d <- (mid - intercept_7d) / slope_7d
+        y_cross0.5_7d
+
+        plot_SMA7d <- ggplot(SMA_7d_summary, aes(x = noise_level, y = mean_metric)) +
           geom_smooth(method = "lm", se = FALSE, color = "black") +
           geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "#330000", alpha = 0.2) +
-          #geom_line(color = "#330000") +
+          
           geom_point(color = "#330000") +
-          geom_segment(aes(x = 0, y = mid, xend = 1, yend = mid), 
-                       linetype = "dashed", color = "black", alpha = 0.4) +  #horizontal dashed line
+          geom_segment(aes(x = 0, y = mid, xend = 1, yend = mid),
+            linetype = "dashed", color = "black", alpha = 0.4
+          ) + # horizontal dashed line
           scale_x_continuous(
-            name = "Relative % Noise", 
+            name = "Relative % Noise",
             limits = c(0, 1),
             breaks = seq(0, 1, by = 0.1)
           ) +
           labs(
-            title = paste0("Mean ", metric_name_list[i], " \n- ",C_list[g]),
+            title = paste0("Mean ", metric_name_list[i], " \n- ", C_list[g]),
             y = paste0("Mean ", metric_name_list[i])
           ) +
           theme_minimal() +
           ylim(ymin, ymax)
-        
-        if(C_list[g] == "xxx-day SMA" || C_list[g] == "agegroup3"){
-          print(plot_SMAxd + plot_SMAxxd + plot_SMAxxxd)
-          if (metric == "mean_dev"){
-            print(paste0("For ", A_list[g],", Relative % Noise = ", round(y_cross0.5_xd, 2),", when ",metric," = ",mid))
-            print(paste0("For ", B_list[g],", Relative % Noise = ", round(y_cross0.5_xxd, 2),", when ",metric," = ",mid))
-            print(paste0("For ", C_list[g],", Relative % Noise = ", round(y_cross0.5_xxxd, 2),", when ",metric," = ",mid))
+
+        if (D_list[g] == "1-day (raw)") {
+          print(plot_SMA1d + plot_SMA3d + plot_SMA5d + plot_SMA7d)
+          if (metric == "mean_dev") {
+            print(paste0("For ", D_list[g], ", Relative % Noise = ", round(y_cross0.5_1d, 2), ", when ", metric, " = ", mid))
+            print(paste0("For ", A_list[g], ", Relative % Noise = ", round(y_cross0.5_3d, 2), ", when ", metric, " = ", mid))
+            print(paste0("For ", B_list[g], ", Relative % Noise = ", round(y_cross0.5_5d, 2), ", when ", metric, " = ", mid))
+            print(paste0("For ", C_list[g], ", Relative % Noise = ", round(y_cross0.5_7d, 2), ", when ", metric, " = ", mid))
           } else {
-            print(paste0("For ", A_list[g],", Slope = ",round(slope_xd,2)))
-            print(paste0("For ", B_list[g],", Slope = ",round(slope_xxd,2)))
-            print(paste0("For ", C_list[g],", Slope = ",round(slope_xxxd,2)))
-          }        
-          
-          
+            print(paste0("For ", D_list[g], ", Slope = ", round(slope_1d, 2)))
+            print(paste0("For ", A_list[g], ", Slope = ", round(slope_3d, 2)))
+            print(paste0("For ", B_list[g], ", Slope = ", round(slope_5d, 2)))
+            print(paste0("For ", C_list[g], ", Slope = ", round(slope_7d, 2)))
+          }
+        } else if (C_list[g] == "7-day SMA" || C_list[g] == "Total") {
+          print(plot_SMA3d + plot_SMA5d + plot_SMA7d)
+          if (metric == "mean_dev") {
+            print(paste0("For ", A_list[g], ", Relative % Noise = ", round(y_cross0.5_3d, 2), ", when ", metric, " = ", mid))
+            print(paste0("For ", B_list[g], ", Relative % Noise = ", round(y_cross0.5_5d, 2), ", when ", metric, " = ", mid))
+            print(paste0("For ", C_list[g], ", Relative % Noise = ", round(y_cross0.5_7d, 2), ", when ", metric, " = ", mid))
+          } else {
+            print(paste0("For ", A_list[g], ", Slope = ", round(slope_3d, 2)))
+            print(paste0("For ", B_list[g], ", Slope = ", round(slope_5d, 2)))
+            print(paste0("For ", C_list[g], ", Slope = ", round(slope_7d, 2)))
+          }
         } else {
-          print(plot_SMAxd + plot_SMAxxd)
-          if (metric == "mean_dev"){
-            print(paste0("For ", A_list[g],", Relative % Noise = ", round(y_cross0.5_xd, 2),", when ",metric," = ",mid))
-            print(paste0("For ", B_list[g],", Relative % Noise = ", round(y_cross0.5_xxd, 2),", when ",metric," = ",mid))
+          print(plot_SMA3d + plot_SMA5d)
+          if (metric == "mean_dev") {
+            print(paste0("For ", A_list[g], ", Relative % Noise = ", round(y_cross0.5_3d, 2), ", when ", metric, " = ", mid))
+            print(paste0("For ", B_list[g], ", Relative % Noise = ", round(y_cross0.5_5d, 2), ", when ", metric, " = ", mid))
           } else {
-            print(paste0("For ", A_list[g],", Slope = ",round(slope_xd,2)))
-            print(paste0("For ", B_list[g],", Slope = ",round(slope_xxd,2)))
-          }  
-          
+            print(paste0("For ", A_list[g], ", Slope = ", round(slope_3d, 2)))
+            print(paste0("For ", B_list[g], ", Slope = ", round(slope_5d, 2)))
+          }
         }
       }
-      
-      i<-i+1
+
+      i <- i + 1
     }
   }
   print("-------------------------------- Stochastic Simulation Results End here --------------------------------")
-  #Boxplots for SMA Deviance explained
+  # Boxplots for SMA Deviance explained
   {
     SMAdev_df <- tibble(
-      value = c(SMA$'xd_Metrics'$`DevianceExplained`,
-                SMA$'xxd_Metrics'$`DevianceExplained`,
-                SMA$'xxxd_Metrics'$`DevianceExplained`),
-      
-      SMA = c(rep("x-day", length(SMA$'xd_Metrics'$`DevianceExplained`)),
-              rep("xx-day", length(SMA$'xxd_Metrics'$`DevianceExplained`)),
-              rep("xxx-day", length(SMA$'xxxd_Metrics'$`DevianceExplained`)))
+      value = c(
+        SMA$"1d_Metrics"$`DevianceExplained`,
+        SMA$"3d_Metrics"$`DevianceExplained`,
+        SMA$"5d_Metrics"$`DevianceExplained`,
+        SMA$"7d_Metrics"$`DevianceExplained`
+      ),
+      SMA = c(
+        rep("1-day", length(SMA$"1d_Metrics"$`DevianceExplained`)),
+        rep("3-day", length(SMA$"3d_Metrics"$`DevianceExplained`)),
+        rep("5-day", length(SMA$"5d_Metrics"$`DevianceExplained`)),
+        rep("7-day", length(SMA$"7d_Metrics"$`DevianceExplained`))
+      )
     )
-    
+
     kruskal_test_SMAdev <- kruskal.test(value ~ SMA, data = SMAdev_df)
-    if (kruskal_test_SMAdev$p.value<0.05){
+    if (kruskal_test_SMAdev$p.value < 0.05) {
       dunn_result_SMAdev <- dunn.test(
         x = SMAdev_df$value,
         g = SMAdev_df$SMA,
-        method = "bonferroni")
-      print(paste("SMA deviance explained dunn test results: ",dunn_result_SMAdev))
+        method = "bonferroni"
+      )
+      print("SMA deviance explained dunn test results: ")
+      dunn_df <- as.data.frame(dunn_result_SMAdev)
+      print(dunn_df[dunn_df$P.adjusted < 0.05, ])
     } else {
-      print(paste("SMA shows no significant difference for deviance explained, p-value =",kruskal_test_SMAdev$p.value))
+      print(paste("SMA shows no significant difference for deviance explained, p-value =", kruskal_test_SMAdev$p.value))
     }
     SMAdev_df <- SMAdev_df %>%
       filter(SMAdev_df$value > 0)
+
+    # Calculate global max for NRMSE to keep axis consistent
+    max_nrmse <- max(c(
+      SMA$"1d_Metrics"$`RMSE`, SMA$"3d_Metrics"$`RMSE`, SMA$"5d_Metrics"$`RMSE`, SMA$"7d_Metrics"$`RMSE`,
+      age$"Elementary_Metrics"$`RMSE`, age$"Secondary_Metrics"$`RMSE`, age$"Total_Metrics"$`RMSE`,
+      type$"percent_Metrics"$`RMSE`, type$"percentchange_Metrics"$`RMSE`,
+      city$"Ajax_Metrics"$`RMSE`, city$"Pickering_Metrics"$`RMSE`
+    ), na.rm = TRUE)
+
     SMAplot <- ggplot(SMAdev_df, aes(x = SMA, y = value)) +
       geom_boxplot() +
       labs(
@@ -352,6 +473,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "Deviance Explained"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(0, 1)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -364,31 +486,40 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + ylim(0,1)
-    
+      ) +
+      ylim(0, 1)
+
     print(SMAplot)
   }
-  #Boxplots for SMA NRMSE
+  # Boxplots for SMA NRMSE
   {
     SMA2NRMSE_df <- tibble(
-      value = c(SMA$'xd_Metrics'$`NRMSE`,
-                SMA$'xxd_Metrics'$`NRMSE`,
-                SMA$'xxxd_Metrics'$`NRMSE`),
-      
-      SMA = c(rep("x-day", length(SMA$'xd_Metrics'$`NRMSE`)),
-              rep("xx-day", length(SMA$'xxd_Metrics'$`NRMSE`)),
-              rep("xxx-day", length(SMA$'xxxd_Metrics'$`NRMSE`)))
+      value = c(
+        SMA$"1d_Metrics"$`NRMSE`,
+        SMA$"3d_Metrics"$`NRMSE`,
+        SMA$"5d_Metrics"$`NRMSE`,
+        SMA$"7d_Metrics"$`NRMSE`
+      ),
+      SMA = c(
+        rep("1-day", length(SMA$"1d_Metrics"$`NRMSE`)),
+        rep("3-day", length(SMA$"3d_Metrics"$`NRMSE`)),
+        rep("5-day", length(SMA$"5d_Metrics"$`NRMSE`)),
+        rep("7-day", length(SMA$"7d_Metrics"$`NRMSE`))
+      )
     )
-    
+
     kruskal_test_SMA2NRMSE <- kruskal.test(value ~ SMA, data = SMA2NRMSE_df)
-    if (kruskal_test_SMA2NRMSE$p.value<0.05){
+    if (kruskal_test_SMA2NRMSE$p.value < 0.05) {
       dunn_result_SMA2NRMSE <- dunn.test(
         x = SMA2NRMSE_df$value,
         g = SMA2NRMSE_df$SMA2,
-        method = "bonferroni")
-      print(paste("SMA NRMSE dunn test results: ",dunn_result_SMA2NRMSE))
+        method = "bonferroni"
+      )
+      print("SMA NRMSE dunn test results: ")
+      dunn_df <- as.data.frame(dunn_result_SMA2NRMSE)
+      print(dunn_df[dunn_df$P.adjusted < 0.05, ])
     } else {
-      print(paste("SMA shows no significant difference for NRMSE, p-value =",kruskal_test_SMA2NRMSE$p.value))
+      print(paste("SMA shows no significant difference for NRMSE, p-value =", kruskal_test_SMA2NRMSE$p.value))
     }
     SMA2NRMSE_df <- SMA2NRMSE_df %>%
       filter(SMA2NRMSE_df$value > 0)
@@ -400,6 +531,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "NRMSE"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(0, max_nrmse)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -412,33 +544,46 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + ylim(0,0.2)
-    
+      ) +
+      ylim(0, 0.2)
+
     print(SMA2plot)
   }
-  #Boxplots for SMA Optimal offset
+  # Boxplots for SMA Optimal offset
   {
-    SMAoff_df<- tibble(
-      dev = c(SMA$'xd_Metrics'$`DevianceExplained`,
-              SMA$'xxd_Metrics'$`DevianceExplained`,
-              SMA$'xxxd_Metrics'$`DevianceExplained`),
-      value = c(SMA$'xd_Metrics'$`Offset`,
-                SMA$'xxd_Metrics'$`Offset`,
-                SMA$'xxxd_Metrics'$`Offset`),
-      SMA = c(rep("x-day", length(SMA$'xd_Metrics'$`Offset`)),
-              rep("xx-day", length(SMA$'xxd_Metrics'$`Offset`)),
-              rep("xxx-day", length(SMA$'xxxd_Metrics'$`Offset`)))
+    SMAoff_df <- tibble(
+      dev = c(
+        SMA$"1d_Metrics"$`DevianceExplained`,
+        SMA$"3d_Metrics"$`DevianceExplained`,
+        SMA$"5d_Metrics"$`DevianceExplained`,
+        SMA$"7d_Metrics"$`DevianceExplained`
+      ),
+      value = c(
+        SMA$"1d_Metrics"$`Offset`,
+        SMA$"3d_Metrics"$`Offset`,
+        SMA$"5d_Metrics"$`Offset`,
+        SMA$"7d_Metrics"$`Offset`
+      ),
+      SMA = c(
+        rep("1-day", length(SMA$"1d_Metrics"$`Offset`)),
+        rep("3-day", length(SMA$"3d_Metrics"$`Offset`)),
+        rep("5-day", length(SMA$"5d_Metrics"$`Offset`)),
+        rep("7-day", length(SMA$"7d_Metrics"$`Offset`))
+      )
     )
-    
+
     kruskal_test_SMAoff <- kruskal.test(value ~ SMA, data = SMAoff_df)
-    if (kruskal_test_SMAoff$p.value<0.05){
+    if (kruskal_test_SMAoff$p.value < 0.05) {
       dunn_result_SMAoff <- dunn.test(
         x = SMAoff_df$value,
         g = SMAoff_df$SMA,
-        method = "bonferroni")
-      print(paste("SMA optimal offset dunn test results: ",dunn_result_SMAoff))
+        method = "bonferroni"
+      )
+      print("SMA optimal offset dunn test results: ")
+      dunn_df <- as.data.frame(dunn_result_SMAoff)
+      print(dunn_df[dunn_df$P.adjusted < 0.05, ])
     } else {
-      print(paste("SMA shows no significant difference for optimal offset, p-value =",kruskal_test_SMAoff$p.value))
+      print(paste("SMA shows no significant difference for optimal offset, p-value =", kruskal_test_SMAoff$p.value))
     }
     SMAoff_df <- SMAoff_df %>%
       filter(SMAoff_df$dev > 0)
@@ -450,6 +595,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "Optimal offset"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(-7, 7)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -462,34 +608,41 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + ylim(-11,11)
-    
+      ) +
+      ylim(-11, 11)
+
     print(SMA3plot)
   }
-  
-  #Boxplots for Age Deviance explained
+
+  # Boxplots for Age Deviance explained
   {
     agedev_df <- tibble(
-      value = c(age$'agegroup1_Metrics'$`DevianceExplained`,
-                age$'agegroup2_Metrics'$`DevianceExplained`,
-                age$'agegroup3_Metrics'$`DevianceExplained`),
-      
-      age = c(rep("agegroup1", length(age$'agegroup1_Metrics'$`DevianceExplained`)),
-              rep("agegroup2", length(age$'agegroup2_Metrics'$`DevianceExplained`)),
-              rep("agegroup3", length(age$'agegroup3_Metrics'$`DevianceExplained`)))
+      value = c(
+        age$"Elementary_Metrics"$`DevianceExplained`,
+        age$"Secondary_Metrics"$`DevianceExplained`,
+        age$"Total_Metrics"$`DevianceExplained`
+      ),
+      age = c(
+        rep("Elementary", length(age$"Elementary_Metrics"$`DevianceExplained`)),
+        rep("Secondary", length(age$"Secondary_Metrics"$`DevianceExplained`)),
+        rep("Total", length(age$"Total_Metrics"$`DevianceExplained`))
+      )
     )
-    
+
     kruskal_test_agedev <- kruskal.test(value ~ age, data = agedev_df)
-    if (kruskal_test_agedev$p.value<0.05){
+    if (kruskal_test_agedev$p.value < 0.05) {
       dunn_result_agedev <- dunn.test(
         x = agedev_df$value,
         g = agedev_df$age,
-        method = "bonferroni")
-      print(paste("age group and deviance explained dunn test results: ",dunn_result_agedev))
+        method = "bonferroni"
+      )
+      print("age group and deviance explained dunn test results: ")
+      dunn_df <- as.data.frame(dunn_result_agedev)
+      print(dunn_df[dunn_df$P.adjusted < 0.05, ])
     } else {
-      print(paste("age group shows no significant difference for deviance explained, p-value =",kruskal_test_agedev$p.value))
+      print(paste("age group shows no significant difference for deviance explained, p-value =", kruskal_test_agedev$p.value))
     }
-    #Actual plot
+    # Actual plot
     {
       agedev_df <- agedev_df %>%
         filter(agedev_df$value > 0)
@@ -501,6 +654,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           y = "Deviance Explained"
         ) +
         theme_minimal() +
+        coord_cartesian(ylim = c(0, 1)) +
         theme(
           axis.text = element_text(size = 16, face = "plain"),
           axis.text.x = element_text(size = 16),
@@ -513,33 +667,40 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           legend.text = element_text(size = 14),
           legend.title = element_text(size = 14),
           plot.margin = unit(c(1, 1, 1, 1), "lines"),
-        ) + ylim(0,1)
+        ) +
+        ylim(0, 1)
     }
     print(ageplot)
   }
-  #Boxplots for Age NRMSE
+  # Boxplots for Age NRMSE
   {
     ageNRMSE_df <- tibble(
-      value = c(age$'agegroup1_Metrics'$`NRMSE`,
-                age$'agegroup2_Metrics'$`NRMSE`,
-                age$'agegroup3_Metrics'$`NRMSE`),
-      
-      age = c(rep("agegroup1", length(age$'agegroup1_Metrics'$`NRMSE`)),
-              rep("agegroup2", length(age$'agegroup2_Metrics'$`NRMSE`)),
-              rep("agegroup3", length(age$'agegroup3_Metrics'$`NRMSE`)))
+      value = c(
+        age$"Elementary_Metrics"$`NRMSE`,
+        age$"Secondary_Metrics"$`NRMSE`,
+        age$"Total_Metrics"$`NRMSE`
+      ),
+      age = c(
+        rep("Elementary", length(age$"Elementary_Metrics"$`NRMSE`)),
+        rep("Secondary", length(age$"Secondary_Metrics"$`NRMSE`)),
+        rep("Total", length(age$"Total_Metrics"$`NRMSE`))
+      )
     )
-    
+
     kruskal_test_ageNRMSE <- kruskal.test(value ~ age, data = ageNRMSE_df)
-    if (kruskal_test_ageNRMSE$p.value<0.05){
+    if (kruskal_test_ageNRMSE$p.value < 0.05) {
       dunn_result_ageNRMSE <- dunn.test(
         x = ageNRMSE_df$value,
         g = ageNMRSE_df$age,
-        method = "bonferroni")
-      print(paste("age group and NRMSE dunn test results: ",dunn_result_ageNRMSE))
+        method = "bonferroni"
+      )
+      print("age group and NRMSE dunn test results: ")
+      dunn_df <- as.data.frame(dunn_result_ageNRMSE)
+      print(dunn_df[dunn_df$P.adjusted < 0.05, ])
     } else {
-      print(paste("age group shows no significant difference for NRMSE, p-value =",kruskal_test_ageNRMSE$p.value))
+      print(paste("age group shows no significant difference for NRMSE, p-value =", kruskal_test_ageNRMSE$p.value))
     }
-    #Actual plot
+    # Actual plot
     {
       ageNRMSE_df <- ageNRMSE_df %>%
         filter(ageNRMSE_df$value > 0)
@@ -551,6 +712,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           y = "NRMSE"
         ) +
         theme_minimal() +
+        coord_cartesian(ylim = c(0, max_nrmse)) +
         theme(
           axis.text = element_text(size = 16, face = "plain"),
           axis.text.x = element_text(size = 16),
@@ -563,33 +725,43 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           legend.text = element_text(size = 14),
           legend.title = element_text(size = 14),
           plot.margin = unit(c(1, 1, 1, 1), "lines"),
-        ) + ylim(0,0.2)
+        ) +
+        ylim(0, 0.2)
     }
     print(age2plot)
   }
-  #Boxplots for age Optimal offset
+  # Boxplots for age Optimal offset
   {
-    ageoff_df<- tibble(
-      dev = c(age$'agegroup1_Metrics'$`DevianceExplained`,
-              age$'agegroup2_Metrics'$`DevianceExplained`,
-              age$'agegroup3_Metrics'$`DevianceExplained`),
-      value = c(age$'agegroup1_Metrics'$`Offset`,
-                age$'agegroup2_Metrics'$`Offset`,
-                age$'agegroup3_Metrics'$`Offset`),
-      age = c(rep("agegroup1", length(age$'agegroup1_Metrics'$`Offset`)),
-              rep("agegroup2", length(age$'agegroup2_Metrics'$`Offset`)),
-              rep("agegroup3", length(age$'agegroup3_Metrics'$`Offset`)))
+    ageoff_df <- tibble(
+      dev = c(
+        age$"Elementary_Metrics"$`DevianceExplained`,
+        age$"Secondary_Metrics"$`DevianceExplained`,
+        age$"Total_Metrics"$`DevianceExplained`
+      ),
+      value = c(
+        age$"Elementary_Metrics"$`Offset`,
+        age$"Secondary_Metrics"$`Offset`,
+        age$"Total_Metrics"$`Offset`
+      ),
+      age = c(
+        rep("Elementary", length(age$"Elementary_Metrics"$`Offset`)),
+        rep("Secondary", length(age$"Secondary_Metrics"$`Offset`)),
+        rep("Total", length(age$"Total_Metrics"$`Offset`))
+      )
     )
-    
+
     kruskal_test_ageoff <- kruskal.test(value ~ age, data = ageoff_df)
-    if (kruskal_test_ageoff$p.value<0.05){
+    if (kruskal_test_ageoff$p.value < 0.05) {
       dunn_result_ageoff <- dunn.test(
         x = ageoff_df$value,
         g = ageoff_df$age,
-        method = "bonferroni")
-      print(paste("age group optimal offset dunn test results: ",dunn_result_ageoff))
+        method = "bonferroni"
+      )
+      print("age group optimal offset dunn test results: ")
+      dunn_df <- as.data.frame(dunn_result_ageoff)
+      print(dunn_df[dunn_df$P.adjusted < 0.05, ])
     } else {
-      print(paste("age group shows no significant difference for optimal offset, p-value =",kruskal_test_ageoff$p.value))
+      print(paste("age group shows no significant difference for optimal offset, p-value =", kruskal_test_ageoff$p.value))
     }
     ageoff_df <- ageoff_df %>%
       filter(ageoff_df$dev > 0)
@@ -601,6 +773,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "Optimal offset"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(-7, 7)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -613,33 +786,38 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + ylim(-11,11)
-    
+      ) +
+      ylim(-11, 11)
+
     print(age3plot)
   }
-  
-  #type deviance explained
+
+  # type deviance explained
   {
-    typedev_df<- tibble(
-      value = c(type$'prevelance_Metrics'$`DevianceExplained`,
-                type$'datatype1_Metrics'$`DevianceExplained`),
-      type = c(rep("prevelance", length(type$'prevelance_Metrics'$`DevianceExplained`)),
-               rep("datatype1", length(type$'datatype1_Metrics'$`DevianceExplained`)))
+    typedev_df <- tibble(
+      value = c(
+        type$"prevelance_Metrics"$`DevianceExplained`,
+        type$"incidence_Metrics"$`DevianceExplained`
+      ),
+      type = c(
+        rep("prevelance", length(type$"prevelance_Metrics"$`DevianceExplained`)),
+        rep("incidence", length(type$"incidence_Metrics"$`DevianceExplained`))
+      )
     )
-    
+
     wilcox_test_typedev <- wilcox.test(value ~ type, data = typedev_df, alternative = "two.sided", exact = FALSE)
-    
+
     if (wilcox_test_typedev$p.value < 0.05) {
       print(paste("Significant difference between types (Mann-Whitney U test), p =", round(wilcox_test_typedev$p.value, 4)))
     } else {
       print(paste("No significant difference between types (Mann-Whitney U test), p =", round(wilcox_test_typedev$p.value, 4)))
     }
-    
-    #Filter out non-positive dev values
+
+    # Filter out non-positive dev values
     typedev_df <- typedev_df %>%
       filter(value > 0)
-    
-    #Create the boxplot
+
+    # Create the boxplot
     typeplot <- ggplot(typedev_df, aes(x = type, y = value)) +
       geom_boxplot() +
       labs(
@@ -648,6 +826,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "Deviance Explained"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(0, 1)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -660,33 +839,37 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + 
+      ) +
       ylim(0, 1)
-    
+
     print(typeplot)
   }
-  #type NRMSE
+  # type NRMSE
   {
-    typeNRMSE_df<- tibble(
-      value = c(type$'prevelance_Metrics'$`NRMSE`,
-                type$'datatype1_Metrics'$`NRMSE`),
-      type = c(rep("prevelance", length(type$'prevelance_Metrics'$`NRMSE`)),
-               rep("datatype1", length(type$'datatype1_Metrics'$`NRMSE`)))
+    typeNRMSE_df <- tibble(
+      value = c(
+        type$"prevelance_Metrics"$`NRMSE`,
+        type$"incidence_Metrics"$`NRMSE`
+      ),
+      type = c(
+        rep("prevelance", length(type$"prevelance_Metrics"$`NRMSE`)),
+        rep("incidence", length(type$"incidence_Metrics"$`NRMSE`))
+      )
     )
-    
+
     wilcox_test_typeNRMSE <- wilcox.test(value ~ type, data = typeNRMSE_df, alternative = "two.sided", exact = FALSE)
-    
+
     if (wilcox_test_typeNRMSE$p.value < 0.05) {
       print(paste("Significant difference between type (Mann-Whitney U test), p =", round(wilcox_test_typeNRMSE$p.value, 4)))
     } else {
       print(paste("No significant difference between type (Mann-Whitney U test), p =", round(wilcox_test_typeNRMSE$p.value, 4)))
     }
-    
-    #Filter out non-positive dev values
+
+    # Filter out non-positive dev values
     typeNRMSE_df <- typeNRMSE_df %>%
       filter(value > 0)
-    
-    #Create the boxplot
+
+    # Create the boxplot
     type2plot <- ggplot(typeNRMSE_df, aes(x = type, y = value)) +
       geom_boxplot() +
       labs(
@@ -695,6 +878,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "NRMSE offset"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(0, max_nrmse)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -707,35 +891,41 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + 
+      ) +
       ylim(0, 0.2)
-    
+
     print(type2plot)
   }
-  #type optimal offset
+  # type optimal offset
   {
-    typeoff_df<- tibble(
-      dev = c(type$'prevelance_Metrics'$`DevianceExplained`,
-              type$'datatype1_Metrics'$`DevianceExplained`),
-      value = c(type$'prevelance_Metrics'$`Offset`,
-                type$'datatype1_Metrics'$`Offset`),
-      type = c(rep("prevelance", length(type$'prevelance_Metrics'$`Offset`)),
-               rep("datatype1", length(type$'datatype1_Metrics'$`Offset`)))
+    typeoff_df <- tibble(
+      dev = c(
+        type$"prevelance_Metrics"$`DevianceExplained`,
+        type$"incidence_Metrics"$`DevianceExplained`
+      ),
+      value = c(
+        type$"prevelance_Metrics"$`Offset`,
+        type$"incidence_Metrics"$`Offset`
+      ),
+      type = c(
+        rep("prevelance", length(type$"prevelance_Metrics"$`Offset`)),
+        rep("incidence", length(type$"incidence_Metrics"$`Offset`))
+      )
     )
-    
+
     wilcox_test_typeoff <- wilcox.test(value ~ type, data = typeoff_df, alternative = "two.sided", exact = FALSE)
-    
+
     if (wilcox_test_typeoff$p.value < 0.05) {
       print(paste("Significant difference between type (Mann-Whitney U test), p =", round(wilcox_test_typeoff$p.value, 4)))
     } else {
       print(paste("No significant difference between type (Mann-Whitney U test), p =", round(wilcox_test_typeoff$p.value, 4)))
     }
-    
-    #Filter out non-positive dev values
+
+    # Filter out non-positive dev values
     typeoff_df <- typeoff_df %>%
       filter(dev > 0)
-    
-    #Create the boxplot
+
+    # Create the boxplot
     type3plot <- ggplot(typeoff_df, aes(x = type, y = value)) +
       geom_boxplot() +
       labs(
@@ -744,6 +934,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "Optimal offset"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(-7, 7)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -756,34 +947,38 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + 
+      ) +
       ylim(-11, 11)
-    
+
     print(type3plot)
   }
-  
-  #city deviance explained
+
+  # city deviance explained
   {
-    citydev_df<- tibble(
-      value = c(city$'Cityname2_Metrics'$`DevianceExplained`,
-                city$'Cityname1_Metrics'$`DevianceExplained`),
-      city = c(rep("Cityname2", length(city$'Cityname2_Metrics'$`DevianceExplained`)),
-               rep("Cityname1", length(city$'Cityname1_Metrics'$`DevianceExplained`)))
+    citydev_df <- tibble(
+      value = c(
+        city$"Pickering_Metrics"$`DevianceExplained`,
+        city$"Ajax_Metrics"$`DevianceExplained`
+      ),
+      city = c(
+        rep("Pickering", length(city$"Pickering_Metrics"$`DevianceExplained`)),
+        rep("Ajax", length(city$"Ajax_Metrics"$`DevianceExplained`))
+      )
     )
-    
+
     wilcox_test_citydev <- wilcox.test(value ~ city, data = citydev_df, alternative = "two.sided", exact = FALSE)
-    
+
     if (wilcox_test_citydev$p.value < 0.05) {
       print(paste("Significant difference between cities (Mann-Whitney U test), p =", round(wilcox_test_citydev$p.value, 4)))
     } else {
       print(paste("No significant difference between cities (Mann-Whitney U test), p =", round(wilcox_test_citydev$p.value, 4)))
     }
-    
-    #Filter out non-positive dev values
+
+    # Filter out non-positive dev values
     citydev_df <- citydev_df %>%
       filter(value > 0)
-    
-    #Create the boxplot
+
+    # Create the boxplot
     cityplot <- ggplot(citydev_df, aes(x = city, y = value)) +
       geom_boxplot() +
       labs(
@@ -792,6 +987,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "Deviance Explained"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(0, 1)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -804,33 +1000,37 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + 
+      ) +
       ylim(0, 1)
-    
+
     print(cityplot)
   }
-  #city NRMSE
+  # city NRMSE
   {
-    cityNRMSE_df<- tibble(
-      value = c(city$'Cityname2_Metrics'$`NRMSE`,
-                city$'Cityname1_Metrics'$`NRMSE`),
-      city = c(rep("Cityname2", length(city$'Cityname2_Metrics'$`NRMSE`)),
-               rep("Cityname1", length(city$'Cityname1_Metrics'$`NRMSE`)))
+    cityNRMSE_df <- tibble(
+      value = c(
+        city$"Pickering_Metrics"$`NRMSE`,
+        city$"Ajax_Metrics"$`NRMSE`
+      ),
+      city = c(
+        rep("Pickering", length(city$"Pickering_Metrics"$`NRMSE`)),
+        rep("Ajax", length(city$"Ajax_Metrics"$`NRMSE`))
+      )
     )
-    
+
     wilcox_test_cityNRMSE <- wilcox.test(value ~ city, data = cityNRMSE_df, alternative = "two.sided", exact = FALSE)
-    
+
     if (wilcox_test_cityNRMSE$p.value < 0.05) {
       print(paste("Significant difference between cities (Mann-Whitney U test), p =", round(wilcox_test_cityNRMSE$p.value, 4)))
     } else {
       print(paste("No significant difference between cities (Mann-Whitney U test), p =", round(wilcox_test_cityNRMSE$p.value, 4)))
     }
-    
-    #Filter out non-positive dev values
+
+    # Filter out non-positive dev values
     cityNRMSE_df <- cityNRMSE_df %>%
       filter(value > 0)
-    
-    #Create the boxplot
+
+    # Create the boxplot
     city2plot <- ggplot(cityNRMSE_df, aes(x = city, y = value)) +
       geom_boxplot() +
       labs(
@@ -839,6 +1039,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "NRMSE offset"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(0, max_nrmse)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -851,35 +1052,41 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + 
+      ) +
       ylim(0, 0.2)
-    
+
     print(city2plot)
   }
-  #city optimal offset
+  # city optimal offset
   {
-    cityoff_df<- tibble(
-      dev = c(city$'Cityname2_Metrics'$`DevianceExplained`,
-              city$'Cityname1_Metrics'$`DevianceExplained`),
-      value = c(city$'Cityname2_Metrics'$`Offset`,
-                city$'Cityname1_Metrics'$`Offset`),
-      city = c(rep("Cityname2", length(city$'Cityname2_Metrics'$`Offset`)),
-               rep("Cityname1", length(city$'Cityname1_Metrics'$`Offset`)))
+    cityoff_df <- tibble(
+      dev = c(
+        city$"Pickering_Metrics"$`DevianceExplained`,
+        city$"Ajax_Metrics"$`DevianceExplained`
+      ),
+      value = c(
+        city$"Pickering_Metrics"$`Offset`,
+        city$"Ajax_Metrics"$`Offset`
+      ),
+      city = c(
+        rep("Pickering", length(city$"Pickering_Metrics"$`Offset`)),
+        rep("Ajax", length(city$"Ajax_Metrics"$`Offset`))
+      )
     )
-    
+
     wilcox_test_cityoff <- wilcox.test(value ~ city, data = cityoff_df, alternative = "two.sided", exact = FALSE)
-    
+
     if (wilcox_test_cityoff$p.value < 0.05) {
       print(paste("Significant difference between cities (Mann-Whitney U test), p =", round(wilcox_test_cityoff$p.value, 4)))
     } else {
       print(paste("No significant difference between cities (Mann-Whitney U test), p =", round(wilcox_test_cityoff$p.value, 4)))
     }
-    
-    #Filter out non-positive dev values
+
+    # Filter out non-positive dev values
     cityoff_df <- cityoff_df %>%
       filter(dev > 0)
-    
-    #Create the boxplot
+
+    # Create the boxplot
     city3plot <- ggplot(cityoff_df, aes(x = city, y = value)) +
       geom_boxplot() +
       labs(
@@ -888,6 +1095,7 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         y = "Optimal offset"
       ) +
       theme_minimal() +
+      coord_cartesian(ylim = c(-7, 7)) +
       theme(
         axis.text = element_text(size = 16, face = "plain"),
         axis.text.x = element_text(size = 16),
@@ -900,57 +1108,61 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         legend.text = element_text(size = 14),
         legend.title = element_text(size = 14),
         plot.margin = unit(c(1, 1, 1, 1), "lines"),
-      ) + 
+      ) +
       ylim(-11, 11)
-    
+
     print(city3plot)
   }
-  
-  #SMA F values
+
+  # SMA Drop in % Deviance
   {
-    for (fval_name in fval_list){
-      pval_name <- paste0(substr(fval_name, 1, nchar(fval_name) - 1),"Pval")
-      fval_df <- tibble(
+    for (devdrop_name_orig in devdrop_list) {
+      devdrop_name <- devdrop_name_orig
+      pval_name <- paste0(sub("DropDevPct", "", devdrop_name_orig), "Pval")
+      devdrop_df <- tibble(
         value = (c(
-          SMA$'xd_Metrics'[[fval_name]],
-          SMA$'xxd_Metrics'[[fval_name]],
-          SMA$'xxxd_Metrics'[[fval_name]])),
+          SMA$"1d_Metrics"[[devdrop_name]],
+          SMA$"3d_Metrics"[[devdrop_name]],
+          SMA$"5d_Metrics"[[devdrop_name]],
+          SMA$"7d_Metrics"[[devdrop_name]]
+        )),
         pval = c(
-          SMA$'xd_Metrics'[[pval_name]],
-          SMA$'xxd_Metrics'[[pval_name]],
-          SMA$'xxxd_Metrics'[[pval_name]]),
+          SMA$"1d_Metrics"[[pval_name]],
+          SMA$"3d_Metrics"[[pval_name]],
+          SMA$"5d_Metrics"[[pval_name]],
+          SMA$"7d_Metrics"[[pval_name]]
+        ),
         SMA = c(
-          rep("x-day", length(SMA$'xd_Metrics'$'DevianceExplained')),
-          rep("xx-day", length(SMA$'xxd_Metrics'$'DevianceExplained')),
-          rep("xxx-day", length(SMA$'xxxd_Metrics'$'DevianceExplained')))
-      )
-      
-      plot(fval_df$value, fval_df$pval,
-           main = "Scatter Plot of F-value vs p-value",
-           xlab = "F-value",
-           ylab = "p-value",
-           pch = 16) 
-      
-      
-      #Kruskal-Wallis test
-      kruskal_test <- kruskal.test(value ~ SMA, data = fval_df)
-      
-      #Perform Dunn's test if significant
-      if (kruskal_test$p.value < 0.05) {
-        dunn_result <- dunn.test(
-          x = fval_df$value,
-          g = fval_df$SMA,
-          method = "bonferroni"
+          rep("1-day", length(SMA$"1d_Metrics"$"DevianceExplained")),
+          rep("3-day", length(SMA$"3d_Metrics"$"DevianceExplained")),
+          rep("5-day", length(SMA$"5d_Metrics"$"DevianceExplained")),
+          rep("7-day", length(SMA$"7d_Metrics"$"DevianceExplained"))
         )
-        print(paste("Significant difference in F-value of", fval_name, "via Dunn's test:", dunn_result$P.adjusted))
-      } else {
-        print(paste("No significant difference in F-value of", fval_name, "p-value =", kruskal_test$p.value))
-      }
-      
-      fval_df <- fval_df %>%
+      )
+
+      plot(devdrop_df$value, devdrop_df$pval,
+        main = "Scatter Plot of Drop in % Deviance Explained vs p-value",
+        xlab = "Drop in Deviance",
+        ylab = "p-value",
+        pch = 16
+      )
+
+
+      # Pairwise Wilcoxon Rank-Sum test
+      wilcox_result <- pairwise.wilcox.test(
+        x = devdrop_df$value,
+        g = devdrop_df$SMA,
+        p.adjust.method = "bonferroni",
+        exact = FALSE
+      )
+
+      print(paste("Wilcoxon Rank-Sum test results for", devdrop_name, "between SMA groups:"))
+      print(wilcox_result)
+
+      devdrop_df <- devdrop_df %>%
         filter(value > 0)
-      
-      fval_summary <- fval_df %>%
+
+      devdrop_summary <- devdrop_df %>%
         group_by(SMA) %>%
         summarise(
           median_f = median(value, na.rm = TRUE),
@@ -961,20 +1173,21 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         mutate(
           median_f = round(median_f, 3)
         )
-      
-      
-      cat("\nSummary: F-values for", fval_name, "by SMA window \n")
-      print(fval_summary)
-      
-      #actual plot
-      plot <- ggplot(fval_df, aes(x = SMA, y = value)) +
+
+
+      cat("\nSummary: Drop in Deviance for", devdrop_name, "by SMA window \n")
+      print(devdrop_summary)
+
+      # actual plot
+      plot <- ggplot(devdrop_df, aes(x = SMA, y = value)) +
         geom_boxplot() +
         labs(
-          title = paste0(fval_name, "-values by various SMA windows"),
+          title = paste0(devdrop_name, " by various SMA windows"),
           x = "Simple Moving Average (SMA) Window",
-          y = "F-value"
+          y = "Drop in % Deviance Explained"
         ) +
         theme_minimal() +
+        coord_cartesian(ylim = c(0, 75)) +
         theme(
           axis.text = element_text(size = 16, face = "plain"),
           axis.text.x = element_text(size = 16),
@@ -987,58 +1200,57 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           legend.text = element_text(size = 14),
           legend.title = element_text(size = 14),
           plot.margin = unit(c(1, 1, 1, 1), "lines"),
-        ) + 
-        ylim(0, 75)
-      
+        )
+
       print(plot)
     }
   }
-  
-  #age F values
+
+  # age Drop in % Deviance
   {
-    for (fval_name in fval_list){
-      
-      pval_name <- paste0(substr(fval_name, 1, nchar(fval_name) - 1),"Pval")
-      fval_df <- tibble(
+    for (devdrop_name_orig in devdrop_list) {
+      devdrop_name <- devdrop_name_orig
+      pval_name <- paste0(sub("DropDevPct", "", devdrop_name_orig), "Pval")
+      devdrop_df <- tibble(
         value = (c(
-          age$'agegroup1_Metrics'[[fval_name]],
-          age$'agegroup2_Metrics'[[fval_name]],
-          age$'agegroup3_Metrics'[[fval_name]])),
+          age$"Elementary_Metrics"[[devdrop_name]],
+          age$"Secondary_Metrics"[[devdrop_name]],
+          age$"Total_Metrics"[[devdrop_name]]
+        )),
         pval = c(
-          age$'agegroup1_Metrics'[[pval_name]],
-          age$'agegroup2_Metrics'[[pval_name]],
-          age$'agegroup3_Metrics'[[pval_name]]),
+          age$"Elementary_Metrics"[[pval_name]],
+          age$"Secondary_Metrics"[[pval_name]],
+          age$"Total_Metrics"[[pval_name]]
+        ),
         age = c(
-          rep("agegroup1", length(age$'agegroup1_Metrics'$'DevianceExplained')),
-          rep("agegroup2", length(age$'agegroup2_Metrics'$'DevianceExplained')),
-          rep("agegroup3", length(age$'agegroup3_Metrics'$'DevianceExplained')))
-      )
-      
-      plot(fval_df$value, fval_df$pval,
-           main = "Scatter Plot of F-value vs p-value",
-           xlab = "F-value",
-           ylab = "p-value",
-           pch = 16) 
-      
-      #Kruskal-Wallis test
-      kruskal_test <- kruskal.test(value ~ age, data = fval_df)
-      
-      #Perform Dunn's test if significant
-      if (kruskal_test$p.value < 0.05) {
-        dunn_result <- dunn.test(
-          x = fval_df$value,
-          g = fval_df$age,
-          method = "bonferroni"
+          rep("Elementary", length(age$"Elementary_Metrics"$"DevianceExplained")),
+          rep("Secondary", length(age$"Secondary_Metrics"$"DevianceExplained")),
+          rep("Total", length(age$"Total_Metrics"$"DevianceExplained"))
         )
-        print(paste("Significant difference in F-value of", fval_name, "via Dunn's test:", dunn_result$P.adjusted))
-      } else {
-        print(paste("No significant difference in F-value of", fval_name, "p-value =", kruskal_test$p.value))
-      }
-      
-      fval_df <- fval_df %>%
+      )
+
+      plot(devdrop_df$value, devdrop_df$pval,
+        main = "Scatter Plot of Drop in % Deviance Explained vs p-value",
+        xlab = "Drop in Deviance",
+        ylab = "p-value",
+        pch = 16
+      )
+
+      # Pairwise Wilcoxon Rank-Sum test
+      wilcox_result <- pairwise.wilcox.test(
+        x = devdrop_df$value,
+        g = devdrop_df$age,
+        p.adjust.method = "bonferroni",
+        exact = FALSE
+      )
+
+      print(paste("Wilcoxon Rank-Sum test results for", devdrop_name, "between age groups:"))
+      print(wilcox_result)
+
+      devdrop_df <- devdrop_df %>%
         filter(value > 0)
-      
-      fval_summary <- fval_df %>%
+
+      devdrop_summary <- devdrop_df %>%
         group_by(age) %>%
         summarise(
           median_f = median(value, na.rm = TRUE),
@@ -1049,20 +1261,21 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         mutate(
           median_f = round(median_f, 3)
         )
-      
-      
-      cat("\nSummary: F-values for", fval_name, "by Age group \n")
-      print(fval_summary)
-      
-      #actual plot
-      plot <- ggplot(fval_df, aes(x = age, y = value)) +
+
+
+      cat("\nSummary: Drop in % Deviance for", devdrop_name, "by Age group \n")
+      print(devdrop_summary)
+
+      # actual plot
+      plot <- ggplot(devdrop_df, aes(x = age, y = value)) +
         geom_boxplot() +
         labs(
-          title = paste0(fval_name, "-values by various SMA windows"),
+          title = paste0(devdrop_name, " by various SMA windows"),
           x = "Age Group absences",
-          y = "F-value"
+          y = "Drop in % Deviance Explained"
         ) +
         theme_minimal() +
+        coord_cartesian(ylim = c(0, 75)) +
         theme(
           axis.text = element_text(size = 16, face = "plain"),
           axis.text.x = element_text(size = 16),
@@ -1075,54 +1288,52 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           legend.text = element_text(size = 14),
           legend.title = element_text(size = 14),
           plot.margin = unit(c(1, 1, 1, 1), "lines"),
-        ) + 
-        ylim(0, 75)
+        )
       print(plot)
     }
   }
-  
-  #type F values
+
+  # type Drop in % Deviance
   {
-    for (fval_name in fval_list){
-      
-      
-      pval_name <- paste0(substr(fval_name, 1, nchar(fval_name) - 1),"Pval")
-      fval_df <- tibble(
+    for (devdrop_name_orig in devdrop_list) {
+      devdrop_name <- devdrop_name_orig
+      pval_name <- paste0(sub("DropDevPct", "", devdrop_name_orig), "Pval")
+      devdrop_df <- tibble(
         value = (c(
-          type$'prevelance_Metrics'[[fval_name]],
-          type$'datatype1_Metrics'[[fval_name]])),
+          type$"prevelance_Metrics"[[devdrop_name]],
+          type$"incidence_Metrics"[[devdrop_name]]
+        )),
         pval = c(
-          type$'prevelance_Metrics'[[pval_name]],
-          type$'datatype1_Metrics'[[pval_name]]),
+          type$"prevelance_Metrics"[[pval_name]],
+          type$"incidence_Metrics"[[pval_name]]
+        ),
         type = c(
-          rep("Prevelance", length(type$'prevelance_Metrics'$'DevianceExplained')),
-          rep("datatype1", length(type$'datatype1_Metrics'$'DevianceExplained')))
-      )
-      
-      plot(fval_df$value, fval_df$pval,
-           main = "Scatter Plot of F-value vs p-value",
-           xlab = "F-value",
-           ylab = "p-value",
-           pch = 16) 
-      
-      #Kruskal-Wallis test
-      kruskal_test <- kruskal.test(value ~ type, data = fval_df)
-      
-      #Perform Dunn's test if significant
-      if (kruskal_test$p.value < 0.05) {
-        dunn_result <- dunn.test(
-          x = fval_df$value,
-          g = fval_df$type,
-          method = "bonferroni"
+          rep("Prevelance", length(type$"prevelance_Metrics"$"DevianceExplained")),
+          rep("Incidence", length(type$"incidence_Metrics"$"DevianceExplained"))
         )
-        print(paste("Significant difference in F-value of", fval_name, "via Dunn's test:", dunn_result$P.adjusted))
-      } else {
-        print(paste("No significant difference in F-value of", fval_name, "p-value =", kruskal_test$p.value))
-      }
-      
-      fval_df <- fval_df %>%
+      )
+
+      plot(devdrop_df$value, devdrop_df$pval,
+        main = "Scatter Plot of Drop in % Deviance Explained vs p-value",
+        xlab = "Drop in Deviance",
+        ylab = "p-value",
+        pch = 16
+      )
+
+      # Pairwise Wilcoxon Rank-Sum test
+      wilcox_result <- pairwise.wilcox.test(
+        x = devdrop_df$value,
+        g = devdrop_df$type,
+        p.adjust.method = "bonferroni",
+        exact = FALSE
+      )
+
+      print(paste("Wilcoxon Rank-Sum test results for", devdrop_name, "between type groups:"))
+      print(wilcox_result)
+
+      devdrop_df <- devdrop_df %>%
         filter(value > 0)
-      fval_summary <- fval_df %>%
+      devdrop_summary <- devdrop_df %>%
         group_by(type) %>%
         summarise(
           median_f = median(value, na.rm = TRUE),
@@ -1133,20 +1344,21 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         mutate(
           median_f = round(median_f, 3)
         )
-      
-      
-      cat("\nSummary: F-values for", fval_name, "by Type \n")
-      print(fval_summary)
-      
-      #actual plot
-      plot <- ggplot(fval_df, aes(x = type, y = value)) +
+
+
+      cat("\nSummary: Drop in % Deviance for", devdrop_name, "by Type \n")
+      print(devdrop_summary)
+
+      # actual plot
+      plot <- ggplot(devdrop_df, aes(x = type, y = value)) +
         geom_boxplot() +
         labs(
-          title = paste0(fval_name, "-values by various absenteeism types"),
+          title = paste0(devdrop_name, " by various absenteeism types"),
           x = "Type",
-          y = "F-value"
+          y = "Drop in % Deviance Explained"
         ) +
         theme_minimal() +
+        coord_cartesian(ylim = c(0, 75)) +
         theme(
           axis.text = element_text(size = 16, face = "plain"),
           axis.text.x = element_text(size = 16),
@@ -1159,63 +1371,65 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           legend.text = element_text(size = 14),
           legend.title = element_text(size = 14),
           plot.margin = unit(c(1, 1, 1, 1), "lines"),
-        ) + 
-        ylim(0, 75)
+        )
       print(plot)
     }
   }
-  
-  #city F values
+
+  # city Drop in % Deviance
   {
-    for (fval_name in fval_list){
-      
-      fval_df <- tibble(
+    for (devdrop_name_orig in devdrop_list) {
+      devdrop_name <- devdrop_name_orig
+      pval_name_temp <- paste0(sub("DropDevPct", "", devdrop_name_orig), "Pval")
+      devdrop_df <- tibble(
         value = (c(
-          city$'Cityname2_Metrics'[[fval_name]],
-          city$'Cityname1_Metrics'[[fval_name]])),
+          city$"Pickering_Metrics"[[devdrop_name]],
+          city$"Ajax_Metrics"[[devdrop_name]]
+        )),
         city = c(
-          rep("Cityname2", length(city$'Cityname2_Metrics'$'DevianceExplained')),
-          rep("Cityname1", length(city$'Cityname1_Metrics'$'DevianceExplained')))
-      )
-      
-      pval_name <- paste0(substr(fval_name, 1, nchar(fval_name) - 1),"Pval")
-      fval_df <- tibble(
-        value = (c(
-          city$'Cityname2_Metrics'[[fval_name]],
-          city$'Cityname1_Metrics'[[fval_name]])),
-        pval = c(
-          city$'Cityname2_Metrics'[[pval_name]],
-          city$'Cityname1_Metrics'[[pval_name]]),
-        city = c(
-          rep("Cityname2", length(city$'Cityname2_Metrics'$'DevianceExplained')),
-          rep("Cityname1", length(city$'Cityname1_Metrics'$'DevianceExplained')))
-      )
-      
-      plot(fval_df$value, fval_df$pval,
-           main = "Scatter Plot of F-value vs p-value",
-           xlab = "F-value",
-           ylab = "p-value",
-           pch = 16) 
-      
-      #Kruskal-Wallis test
-      kruskal_test <- kruskal.test(value ~ city, data = fval_df)
-      
-      #Perform Dunn's test if significant
-      if (kruskal_test$p.value < 0.05) {
-        dunn_result <- dunn.test(
-          x = fval_df$value,
-          g = fval_df$city,
-          method = "bonferroni"
+          rep("Pickering", length(city$"Pickering_Metrics"$"DevianceExplained")),
+          rep("Ajax", length(city$"Ajax_Metrics"$"DevianceExplained"))
         )
-        print(paste("Significant difference in F-value of", fval_name, "via Dunn's test:", dunn_result$P.adjusted))
-      } else {
-        print(paste("No significant difference in F-value of", fval_name, "p-value =", kruskal_test$p.value))
-      }
-      
-      fval_df <- fval_df %>%
+      )
+
+      pval_name <- paste0(sub("DropDevPct", "", devdrop_name), "Pval")
+      devdrop_df <- tibble(
+        value = (c(
+          city$"Pickering_Metrics"[[devdrop_name]],
+          city$"Ajax_Metrics"[[devdrop_name]]
+        )),
+        pval = c(
+          city$"Pickering_Metrics"[[pval_name]],
+          city$"Ajax_Metrics"[[pval_name]]
+        ),
+        city = c(
+          rep("Pickering", length(city$"Pickering_Metrics"$"DevianceExplained")),
+          rep("Ajax", length(city$"Ajax_Metrics"$"DevianceExplained"))
+        )
+      )
+
+      plot(devdrop_df$value, devdrop_df$pval,
+        main = "Scatter Plot of Drop in % Deviance Explained vs p-value",
+        xlab = "Drop in Deviance",
+        ylab = "p-value",
+        pch = 16
+      )
+
+      # Pairwise Wilcoxon Rank-Sum test
+      wilcox_result <- pairwise.wilcox.test(
+        x = devdrop_df$value,
+        g = devdrop_df$city,
+        p.adjust.method = "bonferroni",
+        exact = FALSE
+      )
+
+      print(paste("Wilcoxon Rank-Sum test results for", devdrop_name, "between city groups:"))
+      print(wilcox_result)
+
+      devdrop_df <- devdrop_df %>%
         filter(value > 0)
-      
-      fval_summary <- fval_df %>%
+
+      devdrop_summary <- devdrop_df %>%
         group_by(city) %>%
         summarise(
           median_f = median(value, na.rm = TRUE),
@@ -1226,20 +1440,21 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
         mutate(
           median_f = round(median_f, 3)
         )
-      
-      
-      cat("\nSummary: F-values for", fval_name, "by City \n")
-      print(fval_summary)
-      
-      #actual plot
-      plot <- ggplot(fval_df, aes(x = city, y = value)) +
+
+
+      cat("\nSummary: Drop in % Deviance for", devdrop_name, "by City \n")
+      print(devdrop_summary)
+
+      # actual plot
+      plot <- ggplot(devdrop_df, aes(x = city, y = value)) +
         geom_boxplot() +
         labs(
-          title = paste0(fval_name, "-values across cities"),
+          title = paste0(devdrop_name, " across cities"),
           x = "Municipality",
-          y = "F-value"
+          y = "Drop in % Deviance Explained"
         ) +
         theme_minimal() +
+        coord_cartesian(ylim = c(0, 75)) +
         theme(
           axis.text = element_text(size = 16, face = "plain"),
           axis.text.x = element_text(size = 16),
@@ -1252,99 +1467,98 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
           legend.text = element_text(size = 14),
           legend.title = element_text(size = 14),
           plot.margin = unit(c(1, 1, 1, 1), "lines"),
-        ) + 
-        ylim(0, 75)
+        )
       print(plot)
     }
   }
-  
-  #All F-values
+
+  # All Drop in % Deviance
   value_tmp <- double()
   pval_tmp <- double()
   virus_tmp <- character()
   cat_tmp <- character()
-  
+
   categories <- c(
-    "Cityname2", "Cityname1",
-    "datatype2", "datatype1",
-    "SMA_xd", "SMA_xxd", "SMA_xxxd",
-    "agegroup1", "agegroup2", "agegroup3"
+    "Pickering", "Ajax",
+    "Prevalence", "Incidence",
+    "SMA_1d", "SMA_3d", "SMA_5d", "SMA_7d",
+    "Elementary", "Secondary", "Total"
   )
-  
-  for (fval_name in fval_list){
-    pval_name <- paste0(substr(fval_name, 1, nchar(fval_name) - 1),"Pval")
-    
+
+  for (devdrop_name_orig in devdrop_list) {
+    devdrop_name <- devdrop_name_orig
+    pval_name <- paste0(sub("DropDevPct", "", devdrop_name_orig), "Pval")
+
     values <- list(
-      city$'Cityname2_Metrics'[[fval_name]],
-      city$'Cityname1_Metrics'[[fval_name]],
-      type$'prevelance_Metrics'[[fval_name]],
-      type$'datatype1_Metrics'[[fval_name]],
-      SMA$'xd_Metrics'[[fval_name]],
-      SMA$'xxd_Metrics'[[fval_name]],
-      SMA$'xxxd_Metrics'[[fval_name]],
-      age$'agegroup1_Metrics'[[fval_name]],
-      age$'agegroup2_Metrics'[[fval_name]],
-      age$'agegroup3_Metrics'[[fval_name]]
+      city$"Pickering_Metrics"[[devdrop_name]],
+      city$"Ajax_Metrics"[[devdrop_name]],
+      type$"prevelance_Metrics"[[devdrop_name]],
+      type$"incidence_Metrics"[[devdrop_name]],
+      SMA$"1d_Metrics"[[devdrop_name]],
+      SMA$"3d_Metrics"[[devdrop_name]],
+      SMA$"5d_Metrics"[[devdrop_name]],
+      SMA$"7d_Metrics"[[devdrop_name]],
+      age$"Elementary_Metrics"[[devdrop_name]],
+      age$"Secondary_Metrics"[[devdrop_name]],
+      age$"Total_Metrics"[[devdrop_name]]
     )
-    
+
     pvals <- list(
-      city$'Cityname2_Metrics'[[pval_name]],
-      city$'Cityname1_Metrics'[[pval_name]],
-      type$'prevelance_Metrics'[[pval_name]],
-      type$'datatype1_Metrics'[[pval_name]],
-      SMA$'xd_Metrics'[[pval_name]],
-      SMA$'xxd_Metrics'[[pval_name]],
-      SMA$'xxxd_Metrics'[[pval_name]],
-      age$'agegroup1_Metrics'[[pval_name]],
-      age$'agegroup2_Metrics'[[pval_name]],
-      age$'agegroup3_Metrics'[[pval_name]]
+      city$"Pickering_Metrics"[[pval_name]],
+      city$"Ajax_Metrics"[[pval_name]],
+      type$"prevelance_Metrics"[[pval_name]],
+      type$"incidence_Metrics"[[pval_name]],
+      SMA$"1d_Metrics"[[pval_name]],
+      SMA$"3d_Metrics"[[pval_name]],
+      SMA$"5d_Metrics"[[pval_name]],
+      SMA$"7d_Metrics"[[pval_name]],
+      age$"Elementary_Metrics"[[pval_name]],
+      age$"Secondary_Metrics"[[pval_name]],
+      age$"Total_Metrics"[[pval_name]]
     )
-    
+
     for (i in seq_along(values)) {
       n_i <- length(values[[i]])
       value_tmp <- c(value_tmp, values[[i]])
       pval_tmp <- c(pval_tmp, pvals[[i]])
-      virus_tmp <- c(virus_tmp, rep(fval_name, n_i))
+      virus_tmp <- c(virus_tmp, rep(devdrop_name, n_i))
       cat_tmp <- c(cat_tmp, rep(categories[i], n_i))
     }
-    
+
     print(length(value_tmp))
     print(length(pval_tmp))
     print(length(virus_tmp))
   }
-  
-  fval_df <- tibble(
+
+  devdrop_df <- tibble(
     value = as.numeric(value_tmp),
     pval = as.numeric(pval_tmp),
     virus = as.character(virus_tmp),
     category = as.character(cat_tmp)
   )
-  
-  plot(fval_df$value, fval_df$pval,
-       main = "Scatter Plot of F-value vs p-value",
-       xlab = "F-value",
-       ylab = "p-value",
-       pch = 16) 
-  
-  #Kruskal-Wallis test
-  kruskal_test <- kruskal.test(value ~ virus, data = fval_df)
-  
-  #Perform Dunn's test if significant
-  if (kruskal_test$p.value < 0.05) {
-    dunn_result <- dunn.test(
-      x = fval_df$value,
-      g = fval_df$virus,
-      method = "bonferroni"
-    )
-    print(paste("Significant difference in F-values via Dunn's test:", dunn_result$P.adjusted))
-  } else {
-    print(paste("No significant difference in F-values p-value =", kruskal_test$p.value))
-  }
-  
-  fval_df <- fval_df %>%
+
+  plot(devdrop_df$value, devdrop_df$pval,
+    main = "Scatter Plot of Drop in % Deviance Explained vs p-value",
+    xlab = "Drop in Deviance",
+    ylab = "p-value",
+    pch = 16
+  )
+
+  # Pairwise Wilcoxon Rank-Sum test
+  wilcox_result <- pairwise.wilcox.test(
+    x = devdrop_df$value,
+    g = devdrop_df$virus,
+    p.adjust.method = "bonferroni",
+    exact = FALSE
+  )
+
+  print(paste("Wilcoxon Rank-Sum test results between viruss:"))
+  print(wilcox_result)
+
+  devdrop_df <- devdrop_df %>%
     filter(value > 0)
-  
-  fval_summary <- fval_df %>%
+
+  devdrop_summary <- devdrop_df %>%
     group_by(virus) %>%
     summarise(
       median_f = median(value, na.rm = TRUE),
@@ -1355,28 +1569,45 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
     mutate(
       median_f = round(median_f, 3)
     )
-  
-  cat("\nSummary: F-values by virus \n")
-  print(fval_summary)
-  
-  #actual plot
-  fval_df$category <- factor(fval_df$category, levels = c("SMA_xd", "SMA_xxd", "SMA_xxxd","agegroup1","agegroup2","agegroup3","datatype1","datatype2","Cityname1","Cityname2"))
+
+  cat("\nSummary: Drop in % Deviance by virus \n")
+  print(devdrop_summary)
+
+  # actual plot
+  devdrop_df$category <- factor(devdrop_df$category, levels = c("SMA_1d", "SMA_3d", "SMA_5d", "SMA_7d", "Elementary", "Secondary", "Total", "Incidence", "Prevalence", "Ajax", "Pickering"))
   virus_colours <- c("Enterovirus" = "red", "Influenza A" = "purple", "Norovirus GII" = "green")
-  fval_df$virus <- recode(
-    fval_df$virus,
-    EVF   = "Enterovirus",
-    InfAF = "Influenza A",
-    NoroF = "Norovirus GII"
+  devdrop_df$virus <- recode(
+    devdrop_df$virus,
+    EVDropDevPct   = "Enterovirus",
+    InfADropDevPct = "Influenza A",
+    NoroDropDevPct = "Norovirus GII"
   )
-  
-  plot <- ggplot(fval_df, aes(x = category, y = value, fill = virus)) +
+
+  plot <- ggplot(devdrop_df, aes(x = category, y = value, fill = virus)) +
     geom_boxplot(position = position_dodge(width = 0.8)) +
+    geom_signif(
+      y_position = c(65),
+      xmin = c(1 - 0.2667),
+      xmax = c(1),
+      annotation = c("*"),
+      tip_length = 0.02,
+      vjust = 0.5
+    ) +
+    geom_signif(
+      y_position = c(72, 65),
+      xmin = c(1 - 0.2667, 9 - 0.2667),
+      xmax = c(1 + 0.2667, 9 + 0.2667),
+      annotation = c("*", "*"),
+      tip_length = 0.02,
+      vjust = 0.5
+    ) +
     labs(
-      title = "F-values by viral signal",
+      title = "Drop in % Deviance Explained by viral signal",
       x = "Category",
-      y = "F-value"
+      y = "Drop in % Deviance Explained"
     ) +
     theme_minimal() +
+    coord_cartesian(ylim = c(0, 100)) +
     theme(
       axis.text = element_text(size = 16, face = "plain"),
       axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
@@ -1389,48 +1620,47 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
       legend.text = element_text(size = 14),
       legend.title = element_text(size = 14),
       plot.margin = unit(c(1, 1, 1, 1), "lines")
-    ) + 
-    ylim(0, 75) +
+    ) +
     scale_fill_manual(values = virus_colours)
-  
+
   print(plot)
-  
-  
-  print(SMAplot+ageplot+typeplot+cityplot)
-  print(SMA2plot+age2plot+type2plot+city2plot)
-  print(SMA3plot+age3plot+type3plot+city3plot)
-  
+
+
+  print(SMAplot + ageplot + typeplot + cityplot)
+  print(SMA2plot + age2plot + type2plot + city2plot)
+  print(SMA3plot + age3plot + type3plot + city3plot)
+
   min_NRMSE <- data.frame()
   min_NRMSE <- data_list[[1]] %>%
-    select(file,NRMSE)
+    select(file, NRMSE)
   high_cross <- 0
   max_devexpl <- data_list[[1]] %>%
-    select(file,DevianceExplained)
-  for (list in names(data_list)){
+    select(file, DevianceExplained)
+  for (list in names(data_list)) {
     all_NRMSE <- data_list[[list]][["NRMSE"]]
     devexpl <- data_list[[list]][["DevianceExplained"]]
     sim <- data_list[[list]][["noise_level"]]
-    
-    if (!is.null(all_NRMSE)){
-      if (all_NRMSE<min_NRMSE$NRMSE){
+
+    if (!is.null(all_NRMSE)) {
+      if (all_NRMSE < min_NRMSE$NRMSE) {
         min_NRMSE$NRMSE <- all_NRMSE
         min_NRMSE$file <- list
       }
-      if (devexpl>max_devexpl$DevianceExplained){
+      if (devexpl > max_devexpl$DevianceExplained) {
         max_devexpl$DevianceExplained <- devexpl
         max_devexpl$file <- list
       }
     }
-    if(!is.null(sim)){
+    if (!is.null(sim)) {
       devsim <- data_list[[list]] %>%
-        select(file,noise_level,mean_dev)
-      devsim_line <- lm(devsim$mean_dev~devsim$noise_level)
+        select(file, noise_level, mean_dev)
+      devsim_line <- lm(devsim$mean_dev ~ devsim$noise_level)
       coef_vals_devsim <- coef(devsim_line)
       intercept_devsim <- coef_vals_devsim[1]
       slope_devsim <- coef_vals_devsim[2]
-      
-      y_cross0.5_devsim <- round((0.5 - intercept_devsim) / slope_devsim,2)
-      if (y_cross0.5_devsim>high_cross){
+
+      y_cross0.5_devsim <- round((0.5 - intercept_devsim) / slope_devsim, 2)
+      if (y_cross0.5_devsim > high_cross) {
         best_sim <- devsim
         best_sim$cross <- y_cross0.5_devsim
       }
@@ -1439,18 +1669,633 @@ setwd("enter/working/directory/file/path") #Change this to actual directory
 }
 print(min_NRMSE)
 print(max_devexpl)
-print(paste0(unique(best_sim$file)," crossing 50% deviance explained at ",unique(best_sim$cross)))
+print(paste0(unique(best_sim$file), " crossing 50% deviance explained at ", unique(best_sim$cross)))
 
 
-custom_order <- c("x-day", "xx-day", "xxx-day", "agegroup1", "agegroup2", 
-                  "agegroup3", "datatype1", "datatype2", "Cityname1", "Cityname2")
+custom_order <- c(
+  "1-day", "3-day", "5-day", "7-day", "Elementary", "Secondary",
+  "Total", "incidence", "prevalence", "Ajax", "Pickering"
+)
 
-dev_df <- as.data.frame(rbind(as.matrix(SMAdev_df), 
-                              as.matrix(agedev_df), 
-                              as.matrix(typedev_df), 
-                              as.matrix(citydev_df))) 
+dev_df <- as.data.frame(rbind(
+  as.matrix(SMAdev_df),
+  as.matrix(agedev_df),
+  as.matrix(typedev_df),
+  as.matrix(citydev_df)
+))
 write.xlsx(dev_df, file = "dev_df.xlsx", overwrite = TRUE)
 
 
+# Pool all metrics files for the summary plots
+all_metrics <- bind_rows(data_list[str_detect(names(data_list), "metrics.xlsx")]) %>%
+  filter(!is.na(DevianceExplained)) %>%
+  mutate(
+    City = ifelse(grepl("Ajax", file), "Ajax", "Pickering"),
+    SMA = case_when(
+      grepl("1d", file) ~ "1d",
+      grepl("3d", file) ~ "3d",
+      grepl("5d", file) ~ "5d",
+      grepl("7d", file) ~ "7d"
+    ),
+    Age = case_when(
+      grepl("Elementary", file) ~ "Elementary",
+      grepl("Secondary", file) ~ "Secondary",
+      grepl("Total", file) ~ "Total"
+    ),
+    Metric = ifelse(grepl("percentchange", file), "Incidence", "Prevalence")
+  )
+
+# Overall single boxplot summary.
+{
+  # Helper function to generate clean, readable model names for the plots
+  clean_name_fn <- function(x) {
+    city <- ifelse(grepl("Ajax", x), "Ajax", "Pickering")
+    metric <- ifelse(grepl("percentchange", x), "Percent Change", "Percent")
+    age <- case_when(
+      grepl("Elementary", x) ~ "Elementary",
+      grepl("Secondary", x) ~ "Secondary",
+      grepl("Total", x) ~ "Total"
+    )
+    sma <- case_when(
+      grepl("1d", x) ~ "1-day (raw)",
+      grepl("3d", x) ~ "3-day SMA",
+      grepl("5d", x) ~ "5-day SMA",
+      grepl("7d", x) ~ "7-day SMA"
+    )
+    paste(city, metric, age, sma, sep = "\n")
+  }
+
+  # Helper function to filter out non-significant comparisons to prevent empty brackets
+  get_sig_comps <- function(df, formula, method = "wilcox.test") {
+    st <- ggpubr::compare_means(formula, data = df, method = method)
+    st <- st[st$p < 0.05, ]
+    if (nrow(st) == 0) {
+      return(NULL)
+    }
+    comps <- list()
+    for (i in 1:nrow(st)) {
+      comps[[i]] <- as.character(c(st$group1[i], st$group2[i]))
+    }
+    return(comps)
+  }
+
+  # Add manual jitter for perfect ggrepel alignment
+  set.seed(42)
+  all_metrics$x_jitter <- 1 + runif(nrow(all_metrics), -0.2, 0.2)
+
+  # Identify top 5 models
+  top5_models <- all_metrics %>%
+    arrange(desc(DevianceExplained)) %>%
+    head(5)
+  top5_models$short_name <- clean_name_fn(top5_models$file)
+
+  overall_plot <- ggplot(all_metrics, aes(y = DevianceExplained)) +
+    geom_boxplot(aes(x = 1), width = 0.5, alpha = 0.5, outlier.shape = NA) +
+    geom_point(aes(x = x_jitter, color = Metric), size = 3, alpha = 0.8) +
+    geom_text_repel(
+      data = subset(top5_models, x_jitter < 1),
+      aes(x = x_jitter, label = short_name),
+      size = 2.5,
+      fontface = "bold",
+      box.padding = 0.5,
+      nudge_x = -0.5,
+      hjust = 1,
+      direction = "y",
+      xlim = c(NA, 0.7),
+      force = 10,
+      max.overlaps = Inf,
+      min.segment.length = 0
+    ) +
+    geom_text_repel(
+      data = subset(top5_models, x_jitter >= 1),
+      aes(x = x_jitter, label = short_name),
+      size = 2.5,
+      fontface = "bold",
+      box.padding = 0.5,
+      nudge_x = 0.5,
+      hjust = 0,
+      direction = "y",
+      xlim = c(1.3, NA),
+      force = 10,
+      max.overlaps = Inf,
+      min.segment.length = 0
+    ) +
+    theme_minimal(base_size = 14) +
+    scale_color_manual(values = c("Incidence" = "#E64B35", "Prevalence" = "#4DBBD5")) +
+    scale_x_continuous(breaks = 1, labels = "All GAMs Tested", limits = c(0, 2)) +
+    labs(
+      title = "Distribution of Deviance Explained Across All Tested GAMs",
+      x = "",
+      y = "Deviance Explained",
+      color = "Metric Type"
+    ) +
+    theme(
+      axis.text.x = element_text(face = "bold", size = 12),
+      legend.position = "bottom",
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    )
+
+  print(overall_plot)
+}
+
+# Top 5 Monte Carlo comparison.
+{
+  # Extract the Monte Carlo files corresponding to the top 5 models
+  top5_mc_files <- gsub("metrics.xlsx", "Monte-Carlo.xlsx", top5_models$file)
+
+  # Pool the 1000 Monte Carlo iterations for these top 5 models
+  mc_list <- list()
+  for (mc_file in top5_mc_files) {
+    if (!is.null(data_list[[mc_file]])) {
+      df <- data_list[[mc_file]]
+      df$model_name <- clean_name_fn(mc_file)
+      mc_list[[mc_file]] <- df
+    }
+  }
+  top5_mc_data <- bind_rows(mc_list)
+
+  # Ensure factors are ordered by median Deviance Explained so the plot looks clean
+  top5_mc_data$model_name <- factor(top5_mc_data$model_name, levels = top5_models$short_name)
+
+  # Calculate 95% Confidence Intervals for Deviance Explained
+  mc_ci_summary <- top5_mc_data %>%
+    group_by(model_name) %>%
+    summarize(
+      Lower_CI = quantile(mean_dev, 0.025, na.rm = TRUE),
+      Median = median(mean_dev, na.rm = TRUE),
+      Upper_CI = quantile(mean_dev, 0.975, na.rm = TRUE)
+    )
+  print("95% Confidence Intervals for Top 5 Models (Deviance Explained):")
+  print(mc_ci_summary)
+
+  # Plot the distributions
+  mc_showdown_plot <- ggplot(top5_mc_data, aes(x = model_name, y = mean_dev, fill = model_name)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 0, hjust = 0.5, face = "bold", lineheight = 0.8)) +
+    labs(
+      title = "Top 5 Models: Monte Carlo Performance Showdown",
+      subtitle = "Distributions over 1,000 Iterations (Superiority determined by 95% CI non-overlap)",
+      x = "Model Configuration",
+      y = "Monte Carlo Deviance Explained"
+    )
+
+  print(mc_showdown_plot)
+}
+
+# Overall deviance explained summary plot.
+{
+  # Filter comparisons
+  sig_city_dev <- get_sig_comps(all_metrics, DevianceExplained ~ City)
+  sig_sma_dev <- get_sig_comps(all_metrics, DevianceExplained ~ SMA)
+  sig_age_dev <- get_sig_comps(all_metrics, DevianceExplained ~ Age)
+  sig_metric_dev <- get_sig_comps(all_metrics, DevianceExplained ~ Metric)
+
+  # Generate individual boxplots with significance overlays
+  p1 <- ggplot(all_metrics, aes(x = City, y = DevianceExplained, fill = City)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "Deviance Explained")
+  if (!is.null(sig_city_dev)) p1 <- p1 + stat_compare_means(method = "wilcox.test", comparisons = sig_city_dev, label = "p.signif")
+
+  p2 <- ggplot(all_metrics, aes(x = SMA, y = DevianceExplained, fill = SMA)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "")
+  if (!is.null(sig_sma_dev)) p2 <- p2 + stat_compare_means(method = "wilcox.test", comparisons = sig_sma_dev, label = "p.signif")
+
+  p3 <- ggplot(all_metrics, aes(x = Age, y = DevianceExplained, fill = Age)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "Deviance Explained")
+  if (!is.null(sig_age_dev)) p3 <- p3 + stat_compare_means(method = "wilcox.test", comparisons = sig_age_dev, label = "p.signif")
+
+  p4 <- ggplot(all_metrics, aes(x = Metric, y = DevianceExplained, fill = Metric)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "")
+  if (!is.null(sig_metric_dev)) p4 <- p4 + stat_compare_means(method = "wilcox.test", comparisons = sig_metric_dev, label = "p.signif")
+
+  # Combine with patchwork
+  combined_plot <- (p1 | p2) / (p3 | p4) +
+    plot_annotation(
+      title = "GAM Performance Summary by Factor",
+      subtitle = "Stratified by City, Smoothing Window, Age Group, and Metric Type"
+    )
+
+  print(combined_plot)
+}
+
+# Overall offset summary plot.
+{
+  # Filter comparisons
+  sig_city_off <- get_sig_comps(all_metrics, Offset ~ City)
+  sig_sma_off <- get_sig_comps(all_metrics, Offset ~ SMA)
+  sig_age_off <- get_sig_comps(all_metrics, Offset ~ Age)
+  sig_metric_off <- get_sig_comps(all_metrics, Offset ~ Metric)
+
+  # Generate individual boxplots with significance overlays
+  o1 <- ggplot(all_metrics, aes(x = City, y = Offset, fill = City)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "Optimal Offset (Days)")
+  if (!is.null(sig_city_off)) o1 <- o1 + stat_compare_means(method = "wilcox.test", comparisons = sig_city_off, label = "p.signif")
+
+  o2 <- ggplot(all_metrics, aes(x = SMA, y = Offset, fill = SMA)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "")
+  if (!is.null(sig_sma_off)) o2 <- o2 + stat_compare_means(method = "wilcox.test", comparisons = sig_sma_off, label = "p.signif")
+
+  o3 <- ggplot(all_metrics, aes(x = Age, y = Offset, fill = Age)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "Optimal Offset (Days)")
+  if (!is.null(sig_age_off)) o3 <- o3 + stat_compare_means(method = "wilcox.test", comparisons = sig_age_off, label = "p.signif")
+
+  o4 <- ggplot(all_metrics, aes(x = Metric, y = Offset, fill = Metric)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "")
+  if (!is.null(sig_metric_off)) o4 <- o4 + stat_compare_means(method = "wilcox.test", comparisons = sig_metric_off, label = "p.signif")
+
+  # Combine with patchwork
+  offset_plot <- (o1 | o2) / (o3 | o4) +
+    plot_annotation(
+      title = "Optimal Offset Summary by Factor",
+      subtitle = "Stratified by City, Smoothing Window, Age Group, and Metric Type"
+    )
+
+  print(offset_plot)
+}
+
+# Overall NRMSE summary plot.
+{
+  # Filter comparisons
+  sig_city_nrmse <- get_sig_comps(all_metrics, NRMSE ~ City)
+  sig_sma_nrmse <- get_sig_comps(all_metrics, NRMSE ~ SMA)
+  sig_age_nrmse <- get_sig_comps(all_metrics, NRMSE ~ Age)
+  sig_metric_nrmse <- get_sig_comps(all_metrics, NRMSE ~ Metric)
+
+  # Generate individual boxplots with significance overlays
+  n1 <- ggplot(all_metrics, aes(x = City, y = NRMSE, fill = City)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "NRMSE")
+  if (!is.null(sig_city_nrmse)) n1 <- n1 + stat_compare_means(method = "wilcox.test", comparisons = sig_city_nrmse, label = "p.signif")
+
+  n2 <- ggplot(all_metrics, aes(x = SMA, y = NRMSE, fill = SMA)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "")
+  if (!is.null(sig_sma_nrmse)) n2 <- n2 + stat_compare_means(method = "wilcox.test", comparisons = sig_sma_nrmse, label = "p.signif")
+
+  n3 <- ggplot(all_metrics, aes(x = Age, y = NRMSE, fill = Age)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "NRMSE")
+  if (!is.null(sig_age_nrmse)) n3 <- n3 + stat_compare_means(method = "wilcox.test", comparisons = sig_age_nrmse, label = "p.signif")
+
+  n4 <- ggplot(all_metrics, aes(x = Metric, y = NRMSE, fill = Metric)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = "")
+  if (!is.null(sig_metric_nrmse)) n4 <- n4 + stat_compare_means(method = "wilcox.test", comparisons = sig_metric_nrmse, label = "p.signif")
+
+  # Combine with patchwork
+  nrmse_plot <- (n1 | n2) / (n3 | n4) +
+    plot_annotation(
+      title = "Normalized Root Mean Square Error Summary by Factor",
+      subtitle = "Stratified by City, Smoothing Window, Age Group, and Metric Type (Lower is Better)"
+    )
+
+  print(nrmse_plot)
+}
+
+# Overall concurvity summary plot.
+{
+  file_matches_conc <- list.files(pattern = ".*_GAM-concurvity.xlsx", full.names = TRUE)
+  if (length(file_matches_conc) > 0) {
+    if (!requireNamespace("tidyr", quietly = TRUE)) install.packages("tidyr")
+
+    conc_list <- list()
+    for (file in file_matches_conc) {
+      df <- read_excel(file, col_names = TRUE)
+      if (nrow(df) > 0) {
+        filename <- basename(file)
+
+        # Extract metadata from filename
+        df$City <- ifelse(grepl("Pickering", filename), "Pickering", "Ajax")
+        df$Metric <- ifelse(grepl("percentchange", filename), "Incidence", "Prevalence")
+        df$Age <- ifelse(grepl("Elementary", filename), "Elementary",
+          ifelse(grepl("Secondary", filename), "Secondary", "Total")
+        )
+        df$SMA <- ifelse(grepl("1d", filename), "1-day",
+          ifelse(grepl("3d", filename), "3-day",
+            ifelse(grepl("5d", filename), "5-day", "7-day")
+          )
+        )
+
+        # Melt to long format
+        long_df <- tidyr::pivot_longer(df, cols = -c(Term, City, Metric, Age, SMA), names_to = "Term2", values_to = "Concurvity")
+
+        # Clean up term names for plotting
+        clean_terms <- function(x) {
+          x <- gsub("s\\(", "", x)
+          x <- gsub("\\)", "", x)
+          x <- gsub("Norodata7d", "Norovirus", x)
+          x <- gsub("EVdata7d", "Enterovirus", x)
+          x <- gsub("InfAdata7d", "Influenza A", x)
+          return(x)
+        }
+        long_df$Term <- clean_terms(long_df$Term)
+        long_df$Term2 <- clean_terms(long_df$Term2)
+
+        conc_list[[filename]] <- long_df
+      }
+    }
+
+    all_conc <- bind_rows(conc_list)
+
+    # Filter out 'para' (parametric terms like intercept) if present
+    all_conc <- all_conc %>% filter(Term != "para", Term2 != "para")
+
+    # Aggregate to get average concurvity across models
+    agg_conc <- all_conc %>%
+      group_by(City, SMA, Term, Term2) %>%
+      summarize(Mean_Concurvity = mean(Concurvity, na.rm = TRUE), .groups = "drop")
+
+    # Plot Heatmap
+    conc_plot <- ggplot(agg_conc, aes(x = Term, y = Term2, fill = Mean_Concurvity)) +
+      geom_tile(color = "white") +
+      facet_grid(City ~ SMA) +
+      scale_fill_gradient(low = "white", high = "#E64B35", limits = c(0, 1), name = "Concurvity") +
+      geom_text(aes(label = round(Mean_Concurvity, 2)), color = "black", size = 3) +
+      labs(
+        title = "Pairwise Pathogen Concurvity (Shared Variance)",
+        subtitle = "Averaged across age groups and metric types",
+        x = "",
+        y = ""
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        text = element_text(size = 14),
+        plot.title = element_text(face = "bold", size = 16)
+      )
+
+    print(conc_plot)
+  }
+
+  # Audit v5 figures generation.
+  print("Generating Audit v5 Figures...")
+  
+  # Ensure Figures directory exists
+  figures_dir <- file.path(PROJ, "Figures")
+  if(!dir.exists(figures_dir)) dir.create(figures_dir)
+
+  # 1. Drop-in-Deviance Comparison
+  # Collect deviance drops
+  drop_data <- list()
+  metrics_keys <- names(data_list)[str_detect(names(data_list), pattern = ".*_GAM-metrics.xlsx")]
+  for(k in metrics_keys) {
+    dfm <- data_list[[k]]
+    if(nrow(dfm) > 0 && "NoroDropDevPct" %in% names(dfm)) {
+       row <- dfm[1,]
+       drop_data[[k]] <- data.frame(
+          Model = k,
+          Enterovirus = row$EVDropDevPct,
+          Norovirus_GII = row$NoroDropDevPct,
+          Influenza_A = row$InfADropDevPct
+       )
+    }
+  }
+  if(length(drop_data) > 0) {
+    drop_df <- do.call(rbind, drop_data)
+    drop_long <- tidyr::pivot_longer(drop_df, cols=c("Enterovirus", "Norovirus_GII", "Influenza_A"), names_to="Predictor", values_to="DropPct")
+    
+    fig_drop <- ggplot(drop_long, aes(x=Predictor, y=DropPct, fill=Predictor)) +
+      geom_boxplot(alpha=0.7, outlier.shape=NA) +
+      geom_jitter(width=0.2, alpha=0.6, size=2, color="black") +
+      geom_hline(yintercept=0, linetype="dashed", color="red") +
+      labs(title="Unique Contribution to Accuracy (Drop-in-Deviance)",
+           y="Loss in Deviance Explained (%) when Predictor Removed",
+           x="") +
+      theme_minimal(base_size=14) +
+      scale_fill_manual(values = c("Enterovirus"="red", "Influenza_A"="purple", "Norovirus_GII"="green")) +
+      theme(legend.position="none")
+    
+    ggsave(file.path(figures_dir, "fig_drop_in_deviance.png"), plot=fig_drop, width=8, height=6, bg="white")
+    print("Saved fig_drop_in_deviance.png")
+  }
+
+  # 2. Stochastic Simulation Degradation (Pre vs Post-log)
+  mc_files <- list.files(pattern = ".*_GAM-Monte-Carlo.xlsx", full.names = TRUE)
+  mc_data_list <- list()
+  for(file in mc_files) {
+    base_file <- basename(file)
+    metric_file <- paste0(substr(base_file, 1, nchar(base_file) - 16), "metrics.xlsx")
+    if(metric_file %in% names(data_list) && nrow(data_list[[metric_file]]) > 0) {
+      offset <- as.character(data_list[[metric_file]]$Offset[1])
+      tryCatch({
+        post_df <- read_excel(file, sheet=paste0(offset, "_postlog"))
+        pre_df <- read_excel(file, sheet=paste0(offset, "_prelog"))
+        
+        post_df$Scheme <- "Post-log (Downstream Noise)"
+        post_df$Model <- base_file
+        
+        pre_df$Scheme <- "Pre-log (Assay Noise)"
+        pre_df$Model <- base_file
+        
+        mc_data_list[[paste0(base_file,"_post")]] <- post_df[,c("Model", "noise_level", "mean_dev", "Scheme")]
+        mc_data_list[[paste0(base_file,"_pre")]] <- pre_df[,c("Model", "noise_level", "mean_dev", "Scheme")]
+      }, error=function(e) NULL)
+    }
+  }
+  
+  if(length(mc_data_list) > 0) {
+    mc_all <- do.call(rbind, mc_data_list)
+    mc_agg <- mc_all %>% group_by(Scheme, noise_level) %>%
+      summarise(median_dev = median(mean_dev, na.rm=TRUE),
+                q25 = quantile(mean_dev, 0.25, na.rm=TRUE),
+                q75 = quantile(mean_dev, 0.75, na.rm=TRUE), .groups="drop")
+                
+    fig_mc <- ggplot(mc_agg, aes(x=noise_level, y=median_dev, color=Scheme, fill=Scheme)) +
+      geom_ribbon(aes(ymin=q25, ymax=q75), alpha=0.2, color=NA) +
+      geom_line(size=1.2) +
+      geom_point() +
+      scale_x_continuous(labels = scales::percent_format(scale=100)) +
+      scale_y_continuous(labels = scales::percent_format(scale=100)) +
+      geom_hline(yintercept=0.5, linetype="dotted", color="black") +
+      labs(title="Model Resilience to Simulated Noise",
+           subtitle="Solid line indicates median across retained models; ribbon is IQR",
+           x="Simulated Noise Magnitude (Relative to Predictor SD)",
+           y="Deviance Explained") +
+      theme_minimal(base_size=14) +
+      theme(legend.position="bottom", legend.title=element_blank())
+      
+    ggsave(file.path(figures_dir, "fig_monte_carlo_noise.png"), plot=fig_mc, width=8, height=6, bg="white")
+    print("Saved fig_monte_carlo_noise.png")
+  }
+
+  # 3. Top Model Fit (Pickering_percentElementaryAbsent7d)
+  top_model_val_file <- file.path(PROJ, RESULTS_DIR,
+    "Pickering_percentElementaryAbsent7d_GAM-values.xlsx")
+  if(file.exists(top_model_val_file)) {
+     top_df <- read_excel(top_model_val_file)
+     if ("TotalAbsences" %in% names(top_df) && "fitted" %in% names(top_df) && "Day" %in% names(top_df)) {
+         fig_top <- ggplot(top_df, aes(x=Day)) +
+           geom_point(aes(y=TotalAbsences, color="Observed"), size=2, alpha=0.6) +
+           geom_line(aes(y=fitted, color="Fitted"), size=1.2) +
+           scale_color_manual(values=c("Observed"="black", "Fitted"="#1f77b4")) +
+           labs(title="Top Model Performance: Pickering Elementary (7-day SMA)",
+                subtitle="Deviance Explained: 97%",
+                x="Date",
+                y="Percent Absent due to Illness (%)") +
+           theme_minimal(base_size=14) +
+           theme(legend.title=element_blank(), legend.position="top")
+         
+         ggsave(file.path(figures_dir, "fig_top_model_fit.png"), plot=fig_top, width=10, height=5, bg="white")
+         print("Saved fig_top_model_fit.png")
+     }
+  }
+}
 ```
 
+```{r Attribution and concurvity by family, include=TRUE, warning=FALSE}
+# Compute attribution and concurvity summaries by family.
+{
+  base_dir <- file.path(PROJ, RESULTS_DIR)
+  vir <- c(NoV = "Noro", EV = "EV", InfA = "InfA")
+
+  mfiles <- list.files(base_dir, pattern = "_GAM-metrics\\.xlsx$", full.names = TRUE)
+  met <- do.call(rbind, lapply(mfiles, function(f) {
+    d <- suppressMessages(read_excel(f))
+    if (nrow(d) == 0) return(NULL)
+    d$model <- sub("_GAM-metrics\\.xlsx$", "", basename(f))
+    as.data.frame(d)
+  }))
+
+  if (is.null(met) || nrow(met) == 0) {
+    cat("No metrics workbooks found in", base_dir, "-- attribution summary skipped.\n")
+  } else {
+    if ("ACFResidual" %in% names(met)) met <- met[abs(met$ACFResidual) <= 0.4, ]
+    met$family <- ifelse(grepl("percentchange", met$model),
+      "incidence (gaussian)", "prevalence (betar)")
+
+    # Detect available univariate metric columns.
+    have <- function(suffix) all(paste0(vir, suffix) %in% names(met))
+    winner <- function(d, suffix, dir) {
+      cols <- paste0(vir, suffix)
+      m <- as.matrix(d[, cols, drop = FALSE])
+      idx <- if (dir == "max") max.col(m, ties.method = "first") else max.col(-m, ties.method = "first")
+      names(vir)[idx]
+    }
+
+    crits <- list(
+      list(lbl = "drop-in-deviance (largest)", sfx = "DropDevPct", dir = "max"),
+      list(lbl = "univariate deviance (highest)", sfx = "SingleDevPct", dir = "max"),
+      list(lbl = "univariate AICc (lowest)", sfx = "SingleAICc", dir = "min")
+    )
+
+    cat("\n===== ATTRIBUTION BY FAMILY =====\n")
+    for (cr in crits) {
+      if (!have(cr$sfx)) {
+        cat("\n--", cr$lbl, ": columns not present, skipped\n"); next
+      }
+      met$.win <- winner(met, cr$sfx, cr$dir)
+      tab <- do.call(rbind, lapply(split(met, met$family), function(g) {
+        med <- sapply(vir, function(v) round(median(g[[paste0(v, cr$sfx)]], na.rm = TRUE), 2))
+        data.frame(
+          family = g$family[1], models = nrow(g),
+          EV_wins = sum(g$.win == "EV"), NoV_wins = sum(g$.win == "NoV"),
+          InfA_wins = sum(g$.win == "InfA"),
+          median_EV = med[["EV"]], median_NoV = med[["NoV"]], median_InfA = med[["InfA"]],
+          stringsAsFactors = FALSE
+        )
+      }))
+      cat("\n--", cr$lbl, "\n"); print(tab, row.names = FALSE)
+    }
+
+    # Compute univariate AICc margin.
+    if (have("SingleAICc")) {
+      met$.dAICc <- pmin(met$NoroSingleAICc, met$InfASingleAICc) - met$EVSingleAICc
+      cat("\n-- univariate AICc margin for EV over the next-best single predictor\n")
+      print(do.call(rbind, lapply(split(met, met$family), function(g) data.frame(
+        family = g$family[1], models = nrow(g),
+        median_dAICc = round(median(g$.dAICc, na.rm = TRUE), 2),
+        min_dAICc = round(min(g$.dAICc, na.rm = TRUE), 2),
+        max_dAICc = round(max(g$.dAICc, na.rm = TRUE), 2),
+        favours_EV = sum(g$.dAICc > 0, na.rm = TRUE), stringsAsFactors = FALSE
+      ))), row.names = FALSE)
+    }
+
+    # Compute smooth term concurvity summaries.
+    conc_pairs <- function(kind) {
+      fs <- list.files(base_dir, pattern = paste0("_GAM-concurvity", kind, "\\.xlsx$"),
+        full.names = TRUE)
+      do.call(rbind, lapply(fs, function(f) {
+        d <- as.data.frame(suppressMessages(read_excel(f)))
+        id <- sub(paste0("_GAM-concurvity", kind, "\\.xlsx$"), "", basename(f))
+        rn <- d[[1]]; m <- as.matrix(d[, -1, drop = FALSE])
+        rownames(m) <- rn
+        keep_r <- rownames(m) != "para"; keep_c <- colnames(m) != "para"
+        m <- m[keep_r, keep_c, drop = FALSE]
+        v <- m[row(m) != col(m)]
+        data.frame(model = id, value = as.numeric(v),
+          family = ifelse(grepl("percentchange", id), "incidence (gaussian)", "prevalence (betar)"),
+          stringsAsFactors = FALSE)
+      }))
+    }
+
+    cat("\n===== CONCURVITY BY FAMILY (smooth-smooth pairs, para excluded) =====\n")
+    kinds <- c(worst = "-worst", estimate = "", observed = "-observed")
+    cc <- do.call(rbind, lapply(names(kinds), function(nm) {
+      p <- conc_pairs(kinds[[nm]])
+      if (is.null(p) || nrow(p) == 0) return(NULL)
+      p$measure <- nm
+      p
+    }))
+    if (!is.null(cc) && nrow(cc) > 0) {
+      print(do.call(rbind, lapply(split(cc, list(cc$family, cc$measure), drop = TRUE), function(g)
+        data.frame(family = g$family[1], measure = g$measure[1], pairs = nrow(g),
+          median = round(median(g$value), 3), max = round(max(g$value), 3),
+          pairs_ge_0.8 = sum(g$value >= 0.8),
+          models_ge_0.8 = length(unique(g$model[g$value >= 0.8])),
+          stringsAsFactors = FALSE))), row.names = FALSE)
+    }
+
+    # Read stochastic simulation robustness results if available.
+    attr_cand <- c(
+      file.path(PROJ, "Stochastic Simulation Outputs REMOTE"),
+      file.path(PROJ, "Stochastic Simulation Outputs"),
+      file.path(dirname(base_dir), "Stochastic Simulation Outputs REMOTE"),
+      file.path(dirname(base_dir), "Stochastic Simulation Outputs")
+    )
+    attr_dir <- attr_cand[dir.exists(attr_cand)][1]
+    if (!is.na(attr_dir)) {
+      for (f in c("B1-k-sweep-summary.xlsx", "B2-bootstrap-summary.xlsx",
+        "B2-block-length-sweep.xlsx")) {
+        p <- file.path(attr_dir, f)
+        if (file.exists(p)) {
+          cat("\n=====", sub("\\.xlsx$", "", f), "=====\n")
+          print(as.data.frame(suppressMessages(read_excel(p))), row.names = FALSE)
+        }
+      }
+    }
+  }
+}
+```
