@@ -1,0 +1,2 @@
+"observed_statistic","null_median","null_p95","null_max","n_realisations_scored","N_surrogate","p_empirical","resolution_floor","surrogate_type","seed"
+0.774027104927351,0.490347120189512,0.683802125606994,0.870071961902124,200,200,0.00995024875621891,0.00497512437810945,"trend",1867

@@ -1,0 +1,2 @@
+"observed_max","null_permax_median","null_permax_p95","null_permax_max","observed_percentile","frac_realisations_ge_observed","p_empirical","n_realisations","n_null_fits","n_observed_models"
+0.96886962065198,0.922254817120344,0.983765022104592,0.999643915274357,0.842,0.158,0.158841158841159,1000,9692,15

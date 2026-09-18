@@ -1,0 +1,2 @@
+"observed_statistic","null_median","null_p95","null_max","n_realisations_scored","N_surrogate","p_empirical","resolution_floor","surrogate_type","seed"
+0.856658067921238,0.497286384204757,0.704738167130351,0.888324292628787,970,1000,0.00205973223480947,0.000999000999000999,"AAFT",1867

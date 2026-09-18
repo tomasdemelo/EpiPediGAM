@@ -1,0 +1,22 @@
+STOCHASTIC SIMULATION ROBUSTNESS -- provenance
+generated              : 2026-08-23 22:44:48
+elapsed                : 23.94 mins
+source directory       : Excel Files REMOTE
+models read            : 22
+N_BOOT                 : 1000
+N_BOOT_SWEEP           : 300
+ATTR_K_SWEEP           : 4, 5, 6, 8
+ATTR_BLOCK_SWEEP       : 5, 7, 10
+ATTR_SEED              : 1867
+workers                : 14
+
+B0 reproduction check passed for every model: the refits reproduce the
+deposited drop-in-deviance, univariate deviance and univariate AICc.
+
+Per-model bootstrap percentages are the reportable unit. They are NOT
+p-values and must not be described as such: they are the proportion of
+block-bootstrap replicates in which a given virus ranked first.
+
+R version:
+R version 4.3.3 (2024-02-29)
+mgcv: 1.9.1

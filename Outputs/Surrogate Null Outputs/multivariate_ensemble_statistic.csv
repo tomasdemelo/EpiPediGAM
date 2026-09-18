@@ -1,0 +1,2 @@
+"observed_statistic","null_median","null_p95","null_max","n_realisations_scored","N_surrogate","p_empirical","resolution_floor","surrogate_type","seed"
+0.87301996157521,0.493947799358276,0.715122309095631,0.965343013980582,939,1000,0.00319148936170213,0.000999000999000999,"multivariate",1867
