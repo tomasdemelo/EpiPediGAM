@@ -1,6 +1,6 @@
 # EpiPediGAM
 
-This repository provides Generalized Additive Models (GAMs) and surrogate-null simulation methods to model school absenteeism against wastewater viral signals (Influenza A, Norovirus GII, Enterovirus).
+This repository provides Generalized Additive Models (GAMs), stochastic simulation and surrogate-null simulation methods to model school absenteeism against wastewater viral signals (Influenza A, Norovirus GII, Enterovirus). Factoring in measurement noise (stochastic simulation) and autocorrelation/correlation between predictors (surrogate-null).
 
 Contact: tomas.demelo@ontariotechu.ca
 
