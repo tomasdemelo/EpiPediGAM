@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use EpiPediGAM, please cite it as below."
+title: "EpiPediGAM: generalized additive models and surrogate-null testing of school absenteeism against wastewater viral signals"
+authors:
+  - family-names: "de Melo"
+    given-names: "Tomas"
+    email: "tomas.demelo@ontariotechu.ca"
+version: "0.1.0"
+date-released: "2026-08-23"
